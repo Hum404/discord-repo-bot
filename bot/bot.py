@@ -18,8 +18,6 @@ STORAGE_CHANNEL_NAME = "repository-storage"
 class RepoBot(commands.Bot):
     def __init__(self, config: Config):
         intents = discord.Intents.default()
-        intents.guilds = True
-        intents.members = True
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
         self.db = Database(config.database_path)
