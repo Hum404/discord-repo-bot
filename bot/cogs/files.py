@@ -18,6 +18,16 @@ class FilesCog(commands.Cog, name="文件"):
     def __init__(self, bot: RepoBot):
         self.bot = bot
 
+    async def _resolve_file(self, guild_id: int, ref: str):
+        """支持文件编号（#3 或 3）或完整文件 ID。"""
+        s = ref.strip()
+        digits = s[1:] if s.startswith("#") else s
+        if digits.isdigit():
+            row = await self.bot.db.get_file_by_seq(guild_id, int(digits))
+            if row is not None:
+                return row
+        return await self.bot.db.get_file(s.lower())
+
     # ────────────────────────── 上传 ──────────────────────────
 
     @app_commands.command(name="upload", description="上传文件到仓库")
@@ -81,7 +91,7 @@ class FilesCog(commands.Cog, name="文件"):
             )
             return
 
-        file_id = await self.bot.db.add_file(
+        file_id, seq = await self.bot.db.add_file(
             origin_guild_id=interaction.guild.id,
             name=file.filename,
             size=file.size,
@@ -94,7 +104,7 @@ class FilesCog(commands.Cog, name="文件"):
         )
 
         # 回写文件 ID 到存储消息的 embed，方便管理员对照
-        embed.set_footer(text=f"文件 ID：{file_id}")
+        embed.set_footer(text=f"编号 #{seq} · 文件 ID：{file_id}")
         try:
             await storage_msg.edit(embed=embed)
         except discord.HTTPException:
@@ -115,23 +125,24 @@ class FilesCog(commands.Cog, name="文件"):
         await interaction.followup.send(
             f"✅ 上传成功！\n"
             f"📄 文件名：`{file.filename}`\n"
+            f"🔢 编号：`#{seq}`\n"
             f"🆔 文件 ID：`{file_id}`\n"
             f"💾 大小：{fmt_size(file.size)}\n"
-            f"📥 下载方式：使用 `/download {file_id}`",
+            f"📥 下载方式：使用 `/download {seq}` 或 `/download {file_id}`",
             ephemeral=True,
         )
 
     # ────────────────────────── 下载（溯源核心） ──────────────────────────
 
     @app_commands.command(name="download", description="从仓库下载文件（下载行为会被记录）")
-    @app_commands.describe(file_id="文件 ID（上传时获得，或用 /files 查询）")
+    @app_commands.describe(file_id="文件编号（如 3）或文件 ID（可用 /files 查询）")
     async def download(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None
         await interaction.response.defer(ephemeral=True)
 
-        record = await self.bot.db.get_file(file_id.strip().lower())
+        record = await self._resolve_file(interaction.guild.id, file_id)
         if record is None:
-            await interaction.followup.send("❌ 找不到该文件，请检查文件 ID。", ephemeral=True)
+            await interaction.followup.send("❌ 找不到该文件，请检查编号或文件 ID。", ephemeral=True)
             return
 
         storage_channel = self.bot.get_channel(record["storage_channel_id"])
@@ -230,8 +241,9 @@ class FilesCog(commands.Cog, name="文件"):
         )
         for row in rows:
             uploaded = datetime.fromtimestamp(row["uploaded_at"], tz=timezone.utc)
+            no = f"#{row['seq']} · " if row["seq"] else ""
             embed.add_field(
-                name=f"`{row['file_id']}` · {row['name']}",
+                name=f"{no}`{row['file_id']}` · {row['name']}",
                 value=(
                     f"大小：{fmt_size(row['size'])} · 下载：{row['download_count']} 次\n"
                     f"上传者：<@{row['uploader_id']}> · "
@@ -257,8 +269,9 @@ class FilesCog(commands.Cog, name="文件"):
             title=f"🔍 搜索「{keyword}」", color=discord.Color.blurple()
         )
         for row in rows:
+            no = f"#{row['seq']} · " if row["seq"] else ""
             embed.add_field(
-                name=f"`{row['file_id']}` · {row['name']}",
+                name=f"{no}`{row['file_id']}` · {row['name']}",
                 value=(
                     f"大小：{fmt_size(row['size'])} · 下载：{row['download_count']} 次 · "
                     f"上传者：<@{row['uploader_id']}>"
@@ -270,9 +283,10 @@ class FilesCog(commands.Cog, name="文件"):
     # ────────────────────────── 详情 / 溯源 ──────────────────────────
 
     @app_commands.command(name="fileinfo", description="查看文件详细信息")
-    @app_commands.describe(file_id="文件 ID")
+    @app_commands.describe(file_id="文件编号或文件 ID")
     async def fileinfo(self, interaction: discord.Interaction, file_id: str):
-        record = await self.bot.db.get_file(file_id.strip().lower())
+        assert interaction.guild is not None
+        record = await self._resolve_file(interaction.guild.id, file_id)
         if record is None:
             await interaction.response.send_message("❌ 找不到该文件。", ephemeral=True)
             return
@@ -281,6 +295,8 @@ class FilesCog(commands.Cog, name="文件"):
         embed = discord.Embed(
             title=f"📄 {record['name']}", color=discord.Color.blurple()
         )
+        if record["seq"]:
+            embed.add_field(name="编号", value=f"`#{record['seq']}`", inline=True)
         embed.add_field(name="文件 ID", value=f"`{record['file_id']}`", inline=True)
         embed.add_field(name="大小", value=fmt_size(record["size"]), inline=True)
         embed.add_field(name="类型", value=record["content_type"] or "未知", inline=True)
@@ -296,12 +312,12 @@ class FilesCog(commands.Cog, name="文件"):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="history", description="查看文件的下载溯源记录（上传者或管理员可用）")
-    @app_commands.describe(file_id="文件 ID")
+    @app_commands.describe(file_id="文件编号或文件 ID")
     async def history(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None and isinstance(
             interaction.user, discord.Member
         )
-        record = await self.bot.db.get_file(file_id.strip().lower())
+        record = await self._resolve_file(interaction.guild.id, file_id)
         if record is None:
             await interaction.response.send_message("❌ 找不到该文件。", ephemeral=True)
             return
@@ -315,8 +331,9 @@ class FilesCog(commands.Cog, name="文件"):
             return
 
         rows = await self.bot.db.get_download_history(record["file_id"])
+        no = f"#{record['seq']} · " if record["seq"] else ""
         embed = discord.Embed(
-            title=f"🕵️ 下载溯源：`{record['file_id']}` · {record['name']}",
+            title=f"🕵️ 下载溯源：{no}{record['name']}",
             color=discord.Color.gold(),
         )
         embed.set_footer(text=f"累计下载 {record['download_count']} 次，最多显示最近 20 条")
@@ -335,12 +352,12 @@ class FilesCog(commands.Cog, name="文件"):
     # ────────────────────────── 删除 ──────────────────────────
 
     @app_commands.command(name="delete", description="删除仓库中的文件（上传者或管理员可用）")
-    @app_commands.describe(file_id="文件 ID")
+    @app_commands.describe(file_id="文件编号或文件 ID")
     async def delete(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None and isinstance(
             interaction.user, discord.Member
         )
-        record = await self.bot.db.get_file(file_id.strip().lower())
+        record = await self._resolve_file(interaction.guild.id, file_id)
         if record is None:
             await interaction.response.send_message("❌ 找不到该文件。", ephemeral=True)
             return
