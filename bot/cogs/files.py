@@ -411,8 +411,9 @@ class FilesCog(commands.Cog, name="文件"):
             await interaction.followup.send("❌ 读取文件失败，请稍后重试。", ephemeral=True)
             return
 
-        # ── 先落库，再发文件 ──
         user = interaction.user
+
+        # ── 先落库，再发文件 ──
         await self.bot.db.log_download(
             file_id=record["file_id"],
             user_id=user.id,
@@ -441,8 +442,9 @@ class FilesCog(commands.Cog, name="文件"):
         await self.bot.send_log(interaction.guild, log_embed)
 
         try:
+            note = "此下载已记录"
             await interaction.followup.send(
-                f"📦 `{record['name']}`（此下载已记录）",
+                f"📦 `{record['name']}`（{note}）",
                 file=discord.File(io.BytesIO(data), filename=record["name"]),
                 ephemeral=True,
             )
