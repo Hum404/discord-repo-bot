@@ -37,6 +37,10 @@ class OrganizeVoteView(discord.ui.View):
         scan_channel_ids: set[int] | None,
         required: int,
         initiator: discord.Member,
+        sweep_plan: dict[int, int] | None = None,
+        misplaced: int = 0,
+        filter_mode: str = "black",
+        filter_count: int = 0,
     ):
         super().__init__(timeout=600)
         self.cog = cog
@@ -46,19 +50,45 @@ class OrganizeVoteView(discord.ui.View):
         self.scan_channel_ids = scan_channel_ids
         self.required = required
         self.initiator = initiator
+        self.sweep_plan = sweep_plan or {}
+        self.misplaced = misplaced
+        self.filter_mode = filter_mode
+        self.filter_count = filter_count
         self.voters: set[int] = {initiator.id}
         self.message: discord.Message | None = None
 
     def make_embed(self, title: str, color: discord.Color | None = None) -> discord.Embed:
         voters = "、".join(f"<@{v}>" for v in self.voters)
+        plan = f"📦 错位已登记文件待迁移：**{self.misplaced}** 个\n" if self.misplaced else ""
+        if self.sweep_plan:
+            total = sum(self.sweep_plan.values())
+            top = sorted(self.sweep_plan.items(), key=lambda kv: -kv[1])[:5]
+            names = []
+            for cid, cnt in top:
+                ch = self.guild.get_channel(cid)
+                names.append(f"{ch.mention if ch else f'#{cid}'}（{cnt}）")
+            plan += (
+                f"🧹 待扫描频道 **{len(self.sweep_plan)}** 个，散落文件共 **{total}** 个：\n"
+                + "、".join(names)
+                + (" …" if len(self.sweep_plan) > 5 else "")
+                + "\n"
+            )
+        else:
+            plan += "🧹 未发现散落文件\n"
+        if self.filter_count:
+            plan += (
+                f"🛡️ 已启用{'黑名单' if self.filter_mode == 'black' else '白名单'}"
+                f"（{self.filter_count} 个频道，`/organize_filter` 修改）\n"
+            )
         return discord.Embed(
             title=title,
             description=(
-                f"范围：**{self.scope_label}**\n"
+                f"范围：**{self.scope_label}**\n{plan}\n"
                 f"发起者：{self.initiator.mention}（自动计 1 票）\n"
                 f"所需同意：**{self.required}** 名管理员\n"
                 f"当前票数：**{len(self.voters)}/{self.required}**　{voters}\n"
-                "⏳ 投票 10 分钟内有效"
+                "⏳ 投票 10 分钟内有效\n"
+                "（投票通过后可进一步确认本次整理的频道范围）"
             ),
             color=color or discord.Color.blurple(),
         )
@@ -77,12 +107,18 @@ class OrganizeVoteView(discord.ui.View):
             return
         self.voters.add(interaction.user.id)
         if len(self.voters) >= self.required:
-            self._disable()
-            await interaction.response.edit_message(
-                embed=self.make_embed("✅ 投票通过，开始整理…", discord.Color.green()), view=self
-            )
             self.stop()
-            asyncio.create_task(self._run())
+            # 投票通过 → 交给管理员确认本次整理范围（可临时排除频道）
+            confirm = OrganizeConfirmView(
+                self.cog, self.guild, self.scope_label, self.channel_ids,
+                self.scan_channel_ids, self.sweep_plan, self.misplaced, self.initiator,
+            )
+            await interaction.response.edit_message(embed=confirm.make_embed(), view=confirm)
+            confirm.message = self.message
+            await self.cog.bot.log_admin(
+                self.guild, interaction.user,
+                f"🗳️ 整理投票通过（{self.scope_label}），等待确认范围",
+            )
         else:
             await interaction.response.edit_message(embed=self.make_embed("🗂️ 整理投票"), view=self)
 
@@ -119,11 +155,142 @@ class OrganizeVoteView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
+class OrganizeConfirmView(discord.ui.View):
+    """整理投票通过后：管理员确认本次整理范围（可临时排除频道或写入黑名单）。"""
+
+    def __init__(
+        self,
+        cog: "AdminCog",
+        guild: discord.Guild,
+        scope_label: str,
+        channel_ids: set[int] | None,
+        scan_channel_ids: set[int] | None,
+        sweep_plan: dict[int, int],
+        misplaced: int,
+        initiator: discord.Member,
+    ):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.guild = guild
+        self.scope_label = scope_label
+        self.channel_ids = channel_ids
+        self.scan_channel_ids = scan_channel_ids
+        self.sweep_plan = sweep_plan
+        self.misplaced = misplaced
+        self.initiator = initiator
+        self.excluded: set[int] = set()
+        self.message: discord.Message | None = None
+
+        channels = [guild.get_channel(cid) for cid in sweep_plan]
+        channels = [c for c in channels if c is not None][:25]
+        if channels:
+            select = discord.ui.ChannelSelect(
+                placeholder="选择本次【跳过】的频道（可多选，默认全部整理）",
+                channel_types=[discord.ChannelType.text],
+                min_values=0,
+                max_values=len(channels),
+            )
+            select.callback = self._on_select
+            self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        user = interaction.user
+        if user.id == self.initiator.id:
+            return True
+        if isinstance(user, discord.Member) and user.guild_permissions.administrator:
+            return True
+        await interaction.response.send_message(
+            "❌ 只有管理员可以确认整理范围。", ephemeral=True
+        )
+        return False
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        self.excluded = {int(v) for v in interaction.data.get("values", [])}
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    def make_embed(self) -> discord.Embed:
+        desc = ""
+        if self.misplaced:
+            desc += f"📦 错位已登记文件待迁移：**{self.misplaced}** 个\n"
+        total = 0
+        lines = []
+        for cid, count in sorted(self.sweep_plan.items(), key=lambda kv: -kv[1]):
+            ch = self.guild.get_channel(cid)
+            name = ch.mention if ch else f"#{cid}"
+            if cid in self.excluded:
+                lines.append(f"~~{name}~~ {count} 个（本次跳过）")
+            else:
+                lines.append(f"{name} — {count} 个文件")
+                total += count
+        if lines:
+            shown = "\n".join(lines[:15])
+            if len(lines) > 15:
+                shown += f"\n… 共 {len(lines)} 个频道"
+            desc += f"🧹 待扫描频道（散落文件共 **{total}** 个）：\n{shown}\n"
+        if not desc:
+            desc = "没有发现需要整理的文件。\n"
+        if self.excluded:
+            desc += f"\n🚫 本次跳过 **{len(self.excluded)}** 个频道"
+        return discord.Embed(
+            title="✅ 投票通过 — 确认本次整理范围",
+            description=desc + "\n\n⏳ 请在 10 分钟内确认",
+            color=discord.Color.green(),
+        )
+
+    def _disable(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="确认开始整理", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🗂️ 正在整理…", description="即将开始", color=discord.Color.blurple()
+            ),
+            view=self,
+        )
+        self.stop()
+        await self._run()
+
+    @discord.ui.button(label="排除并永久拉黑", emoji="🚫", style=discord.ButtonStyle.secondary)
+    async def exclude_forever(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.excluded:
+            await interaction.response.send_message(
+                "请先在上方下拉框选择要跳过的频道。", ephemeral=True
+            )
+            return
+        mode, ids = await self.cog.bot.db.get_organize_filter(self.guild.id)
+        if mode == "white":
+            ids -= self.excluded  # 白名单模式：从名单中移除
+        else:
+            ids |= self.excluded  # 黑名单模式：加入名单
+        await self.cog.bot.db.set_organize_filter(self.guild.id, mode, ids)
+        await interaction.response.send_message(
+            f"🚫 已将 {len(self.excluded)} 个频道写入持久"
+            f"{'黑名单' if mode == 'black' else '白名单'}，以后整理自动生效。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="取消整理", emoji="❌", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="已取消",
+                description="本次整理未执行任何操作。",
+                color=discord.Color.light_grey(),
+            ),
+            view=self,
+        )
+        self.stop()
+
     async def _run(self) -> None:
         self.cog._organizing.add(self.guild.id)
         try:
             stats = await self.cog.run_organize(
-                self.guild, self.channel_ids, self.scan_channel_ids, self.message
+                self.guild, self.channel_ids, self.scan_channel_ids, self.message,
+                exclude_channel_ids=self.excluded,
             )
             desc = (
                 f"范围：**{self.scope_label}**\n"
@@ -131,12 +298,14 @@ class OrganizeVoteView(discord.ui.View):
                 f"📝 新登记（本就在存储频道）：{stats['registered']} 个\n"
                 f"⏭️ 无需移动：{stats['skipped']} 个"
             )
+            if self.excluded:
+                desc += f"\n🚫 本次跳过频道：{len(self.excluded)} 个"
             await self.cog.bot.log_admin(
                 self.guild,
                 self.initiator,
                 f"🗂️ 整理完成（{self.scope_label}）：归拢 {stats['moved']} · "
                 f"新登记 {stats['registered']} · 无需移动 {stats['skipped']} · "
-                f"失败 {stats['failed']}",
+                f"跳过频道 {len(self.excluded)} · 失败 {stats['failed']}",
             )
             if stats["failed"]:
                 desc += f"\n⚠️ 失败 {stats['failed']} 个（详情见运行日志）"
@@ -161,6 +330,112 @@ class OrganizeVoteView(discord.ui.View):
                     pass
         finally:
             self.cog._organizing.discard(self.guild.id)
+
+    async def on_timeout(self) -> None:
+        if self.message:
+            try:
+                await self.message.edit(
+                    embed=discord.Embed(
+                        title="确认超时",
+                        description="10 分钟内未确认，本次整理已取消，未执行任何操作。",
+                        color=discord.Color.light_grey(),
+                    ),
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+
+
+class OrganizeFilterView(discord.ui.View):
+    """一键整理的持久黑白名单配置（/organize_filter）。"""
+
+    def __init__(
+        self,
+        bot,
+        guild: discord.Guild,
+        mode: str,
+        channel_ids: set[int],
+    ):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild = guild
+        self.mode = mode
+        self.channel_ids = set(channel_ids)
+        self.saved = False
+
+        mode_select = discord.ui.Select(
+            options=[
+                discord.SelectOption(
+                    label="黑名单模式", value="black", emoji="🚫",
+                    description="整理名单以外的所有频道（推荐）",
+                    default=(mode == "black"),
+                ),
+                discord.SelectOption(
+                    label="白名单模式", value="white", emoji="✅",
+                    description="只整理名单内的频道",
+                    default=(mode == "white"),
+                ),
+            ],
+        )
+        mode_select.callback = self._on_mode
+        self.add_item(mode_select)
+
+        ch_select = discord.ui.ChannelSelect(
+            placeholder="选择名单频道（覆盖式，可多选，最多 25 个）",
+            channel_types=[discord.ChannelType.text],
+            min_values=0,
+            max_values=25,
+        )
+        ch_select.callback = self._on_channels
+        self.add_item(ch_select)
+
+    def make_embed(self) -> discord.Embed:
+        mode_text = (
+            "🚫 黑名单模式：整理【名单以外】的所有频道"
+            if self.mode == "black"
+            else "✅ 白名单模式：只整理【名单内】的频道"
+        )
+        if self.channel_ids:
+            mentions = []
+            for cid in sorted(self.channel_ids)[:25]:
+                ch = self.guild.get_channel(cid)
+                mentions.append(ch.mention if ch else f"`{cid}`（已删除）")
+            ch_text = "、".join(mentions)
+        else:
+            ch_text = "（空）"
+        embed = discord.Embed(
+            title="🗂️ 整理黑白名单配置",
+            description=(
+                f"**模式**：{mode_text}\n\n**名单频道**：\n{ch_text}\n\n"
+                "⚠️ 频道下拉框为覆盖式选择：重新选择会替换整个名单"
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="修改后需点击「保存」生效" + (" · ✅ 已保存" if self.saved else ""))
+        return embed
+
+    async def _on_mode(self, interaction: discord.Interaction) -> None:
+        self.mode = interaction.data["values"][0]
+        self.saved = False
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def _on_channels(self, interaction: discord.Interaction) -> None:
+        self.channel_ids = {int(v) for v in interaction.data.get("values", [])}
+        self.saved = False
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    @discord.ui.button(label="保存", emoji="💾", style=discord.ButtonStyle.success, row=2)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.bot.db.set_organize_filter(
+            self.guild.id, self.mode, self.channel_ids
+        )
+        self.saved = True
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+        await interaction.followup.send("✅ 整理黑白名单已保存。", ephemeral=True)
+        await self.bot.log_admin(
+            interaction.guild, interaction.user,
+            f"🗂️ 修改整理黑白名单：{self.mode} 模式，{len(self.channel_ids)} 个频道",
+        )
 
 
 class ResetVoteView(discord.ui.View):
@@ -636,15 +911,79 @@ class AdminCog(commands.Cog, name="管理"):
             required = ORGANIZE_VOTES_GUILD
             scope_label = "整个服务器"
 
+        # ── 预扫描：统计本次将处理的文件，供投票与范围确认参考 ──
+        await interaction.response.defer()
+        progress = await interaction.followup.send("🔍 正在预扫描整理范围…")
+
+        storage, storage_err = await self.bot.resolve_storage_channel(guild)
+        if storage is None:
+            await progress.edit(content=f"❌ 存储频道不可用：{storage_err}")
+            return
+
+        all_files = await self.bot.db.list_all_files(guild.id)
+        misplaced = sum(
+            1
+            for r in all_files
+            if r["storage_channel_id"] != storage.id
+            and (channel_ids is None or r["storage_channel_id"] in channel_ids)
+        )
+        tracked = {(r["storage_channel_id"], r["storage_message_id"]) for r in all_files}
+
+        # 候选扫描频道（与 run_organize 阶段 2 同一口径），套用持久黑白名单
+        if scan_channel_ids is None:
+            candidates: list = list(guild.text_channels)
+        else:
+            candidates = [
+                ch
+                for cid in scan_channel_ids
+                if isinstance((ch := guild.get_channel(cid)), discord.TextChannel)
+            ]
+        filter_mode, filter_ids = await self.bot.db.get_organize_filter(guild.id)
+        if filter_ids:
+            if filter_mode == "white":
+                candidates = [c for c in candidates if c.id in filter_ids]
+            else:
+                candidates = [c for c in candidates if c.id not in filter_ids]
+
+        # 逐频道统计未登记的文件消息（仅看最近 100 条，作为预览）
+        me = self.bot.user
+        sweep_plan: dict[int, int] = {}
+        for ch in candidates:
+            try:
+                count = 0
+                async for msg in ch.history(limit=100):
+                    if not msg.attachments or (me is not None and msg.author.id == me.id):
+                        continue
+                    if (ch.id, msg.id) in tracked:
+                        continue
+                    count += len(msg.attachments)
+                if count:
+                    sweep_plan[ch.id] = count
+            except discord.Forbidden:
+                continue
+
         view = OrganizeVoteView(
             self, interaction.guild, scope_label, channel_ids, scan_channel_ids,
             required, interaction.user,
+            sweep_plan=sweep_plan, misplaced=misplaced,
+            filter_mode=filter_mode, filter_count=len(filter_ids),
         )
-        await interaction.response.send_message(embed=view.make_embed("🗂️ 整理投票"), view=view)
-        view.message = await interaction.original_response()
+        await progress.edit(content=None, embed=view.make_embed("🗂️ 整理投票"), view=view)
+        view.message = progress
         await self.bot.log_admin(
             interaction.guild, interaction.user, f"🗳️ 发起整理投票（{scope_label}）"
         )
+
+    @app_commands.command(
+        name="organize_filter",
+        description="配置一键整理的频道黑白名单（永久生效，管理员）",
+    )
+    @admin_only
+    async def organize_filter(self, interaction: discord.Interaction):
+        assert interaction.guild is not None
+        mode, channel_ids = await self.bot.db.get_organize_filter(interaction.guild.id)
+        view = OrganizeFilterView(self.bot, interaction.guild, mode, channel_ids)
+        await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
 
     async def run_organize(
         self,
@@ -652,6 +991,7 @@ class AdminCog(commands.Cog, name="管理"):
         channel_ids: set[int] | None,
         scan_channel_ids: set[int] | None,
         message: discord.Message | None,
+        exclude_channel_ids: set[int] | None = None,
     ) -> dict:
         """整理存储文件，分两阶段：
 
@@ -688,6 +1028,9 @@ class AdminCog(commands.Cog, name="管理"):
             if channel_ids is not None and row["storage_channel_id"] not in channel_ids:
                 stats["skipped"] += 1
                 continue
+            if exclude_channel_ids and row["storage_channel_id"] in exclude_channel_ids:
+                stats["skipped"] += 1
+                continue
             if row["storage_channel_id"] == storage.id:
                 stats["skipped"] += 1
                 continue
@@ -722,6 +1065,16 @@ class AdminCog(commands.Cog, name="管理"):
                 for cid in scan_channel_ids
                 if isinstance((ch := guild.get_channel(cid)), discord.TextChannel)
             ]
+
+        # 套用持久黑白名单（以执行时配置为准）+ 本次确认的排除频道
+        filter_mode, filter_ids = await self.bot.db.get_organize_filter(guild.id)
+        if filter_ids:
+            if filter_mode == "white":
+                scan_channels = [c for c in scan_channels if c.id in filter_ids]
+            else:
+                scan_channels = [c for c in scan_channels if c.id not in filter_ids]
+        if exclude_channel_ids:
+            scan_channels = [c for c in scan_channels if c.id not in exclude_channel_ids]
 
         me = self.bot.user
         scanned = 0
