@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..bot import RepoBot, fmt_size
+from ..tracing import inject_trace
 
 log = logging.getLogger("repo-bot")
 
@@ -411,8 +412,13 @@ class FilesCog(commands.Cog, name="文件"):
             await interaction.followup.send("❌ 读取文件失败，请稍后重试。", ephemeral=True)
             return
 
-        # ── 溯源：先落库，再发文件 ──
+        # ── 溯源：向本次下载的副本注入下载者标记（存储原文件不受影响） ──
         user = interaction.user
+        data, traced = inject_trace(
+            data, record["name"], user.id, str(user), record["content_type"]
+        )
+
+        # ── 溯源：先落库，再发文件 ──
         await self.bot.db.log_download(
             file_id=record["file_id"],
             user_id=user.id,
@@ -438,11 +444,14 @@ class FilesCog(commands.Cog, name="文件"):
         log_embed.add_field(
             name="累计下载", value=f"{record['download_count'] + 1} 次", inline=True
         )
+        if traced:
+            log_embed.add_field(name="溯源标记", value="🔖 已注入", inline=True)
         await self.bot.send_log(interaction.guild, log_embed)
 
         try:
+            note = "此下载已记录，文件内嵌溯源标记" if traced else "此下载已记录"
             await interaction.followup.send(
-                f"📦 `{record['name']}`（此下载已记录）",
+                f"📦 `{record['name']}`（{note}）",
                 file=discord.File(io.BytesIO(data), filename=record["name"]),
                 ephemeral=True,
             )

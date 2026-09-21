@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..bot import STORAGE_CHANNEL_NAME, RepoBot, fmt_size
+from ..tracing import extract_trace
 from .files import build_storage_embed
 
 log = logging.getLogger("repo-bot")
@@ -354,6 +355,50 @@ class AdminCog(commands.Cog, name="管理"):
             embed.description = "\n".join(lines)
             embed.set_footer(text=f"最多显示最近 {len(rows)} 条")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ───────────────────── 文件溯源反查 ─────────────────────
+
+    @app_commands.command(name="trace", description="溯源查询：读取疑似外泄文件中的下载标记（管理员）")
+    @app_commands.describe(file="要检查的文件（把外泄的文件传上来）")
+    @admin_only
+    async def trace(self, interaction: discord.Interaction, file: discord.Attachment):
+        assert interaction.guild is not None
+        await interaction.response.defer(ephemeral=True)
+        if file.size > 50 * 1024 * 1024:
+            await interaction.followup.send("❌ 文件过大，无法检查。", ephemeral=True)
+            return
+        try:
+            data = await file.read()
+        except discord.HTTPException:
+            await interaction.followup.send("❌ 读取附件失败，请重试。", ephemeral=True)
+            return
+
+        result = extract_trace(data, file.filename)
+        if result[0] == "hit":
+            _, uid, ts = result
+            desc = (
+                f"🎯 **溯源命中！**\n"
+                f"下载者：<@{uid}>（`{uid}`）\n"
+                f"下载时间：<t:{ts}:F>"
+            )
+            action = f"🔍 溯源 `{file.filename}` → 命中 <@{uid}>"
+        elif result[0] == "image":
+            desc = "该文件是图片：水印为可见文字，请直接查看图片**右下角**的 ID 和时间。"
+            action = f"🔍 溯源 `{file.filename}` → 图片水印（需人工查看）"
+        else:
+            desc = (
+                "未在该文件中发现溯源标记。\n"
+                "可能原因：文件类型不支持标记、标记已被破坏（重打包/转码/截图），"
+                "或文件不是从本仓库下载的。"
+            )
+            action = f"🔍 溯源 `{file.filename}` → 未命中"
+        await self.bot.log_admin(interaction.guild, interaction.user, action)
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="🔍 文件溯源", description=desc, color=discord.Color.gold()
+            ),
+            ephemeral=True,
+        )
 
     # ───────────────────── 仓库统计 ─────────────────────
 
