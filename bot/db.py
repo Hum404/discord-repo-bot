@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS files (
     storage_channel_id INTEGER NOT NULL,
     storage_message_id INTEGER NOT NULL,
     download_count     INTEGER NOT NULL DEFAULT 0,
+    password           TEXT,
     seq                INTEGER
 );
 
@@ -49,7 +50,8 @@ CREATE TABLE IF NOT EXISTS settings (
     storage_guild_id     INTEGER,
     storage_category_id  INTEGER,
     storage_channel_id   INTEGER,
-    log_channel_id       INTEGER
+    log_channel_id       INTEGER,
+    admin_log_channel_id INTEGER
 );
 """
 
@@ -72,12 +74,17 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
-        # 旧库升级：补充 seq 列并回填编号
-        try:
-            await self._conn.execute("ALTER TABLE files ADD COLUMN seq INTEGER")
-            await self._conn.commit()
-        except Exception:
-            pass  # 列已存在
+        # 旧库升级：逐列补充（列已存在则忽略），并回填编号
+        for migration in (
+            "ALTER TABLE files ADD COLUMN seq INTEGER",
+            "ALTER TABLE files ADD COLUMN password TEXT",
+            "ALTER TABLE settings ADD COLUMN admin_log_channel_id INTEGER",
+        ):
+            try:
+                await self._conn.execute(migration)
+                await self._conn.commit()
+            except Exception:
+                pass  # 列已存在
         await self._backfill_seq()
 
     async def close(self) -> None:
@@ -149,6 +156,8 @@ class Database:
         uploader_name: str,
         storage_channel_id: int,
         storage_message_id: int,
+        password: str | None = None,
+        uploaded_at: int | None = None,
     ) -> tuple[str, int]:
         file_id = new_file_id()
         async with self._write_lock:
@@ -162,8 +171,8 @@ class Database:
                 INSERT INTO files (
                     file_id, origin_guild_id, name, size, content_type, description,
                     uploader_id, uploader_name, uploaded_at,
-                    storage_channel_id, storage_message_id, seq
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    storage_channel_id, storage_message_id, password, seq
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     file_id,
@@ -174,9 +183,10 @@ class Database:
                     description,
                     uploader_id,
                     uploader_name,
-                    int(time.time()),
+                    uploaded_at if uploaded_at is not None else int(time.time()),
                     storage_channel_id,
                     storage_message_id,
+                    password,
                     seq,
                 ),
             )
