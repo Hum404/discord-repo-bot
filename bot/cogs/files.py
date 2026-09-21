@@ -120,7 +120,7 @@ class UploadPrepView(discord.ui.View):
         desc += f"🔒 下载密码：{'已设置 ✅' if self.password else '未设置'}\n"
         if self.description:
             desc += f"📝 描述：{self.description}\n"
-        desc += "\n可点击「设置密码」或「重命名」调整，确认无误后点击「确认上传」。"
+        desc += "\n可点击「设置密码」「重命名」调整，确认无误后点击「确认上传」。"
         return discord.Embed(
             title="📤 上传准备", description=desc, color=discord.Color.blurple()
         )
