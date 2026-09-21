@@ -511,9 +511,11 @@ class AdminCog(commands.Cog, name="管理"):
             await interaction.followup.send("❌ 文件过大，无法检查。", ephemeral=True)
             return
         try:
-            data = await file.read()
-        except discord.HTTPException:
-            await interaction.followup.send("❌ 读取附件失败，请重试。", ephemeral=True)
+            data = await asyncio.wait_for(file.read(), timeout=120)
+        except Exception:
+            await interaction.followup.send(
+                "❌ 读取附件失败（Discord CDN 连接异常或超时），请重试。", ephemeral=True
+            )
             return
 
         result = extract_trace(data, file.filename)

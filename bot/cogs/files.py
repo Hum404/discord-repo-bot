@@ -255,9 +255,12 @@ class FilesCog(commands.Cog, name="文件"):
             return
 
         try:
-            data = await file.read()
-        except discord.HTTPException:
-            await interaction.followup.send("❌ 读取附件失败，请重试。", ephemeral=True)
+            data = await asyncio.wait_for(file.read(), timeout=120)
+        except Exception:
+            await interaction.followup.send(
+                "❌ 读取附件失败（Discord CDN 连接异常或超时），请稍后重试。",
+                ephemeral=True,
+            )
             return
 
         view = UploadPrepView(
@@ -304,6 +307,16 @@ class FilesCog(commands.Cog, name="文件"):
                 embed=discord.Embed(
                     title="❌ 上传失败",
                     description=f"上传到存储频道失败：{exc.text or exc}",
+                    color=discord.Color.red(),
+                ),
+                view=None,
+            )
+            return
+        except Exception:
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="❌ 上传失败",
+                    description="网络异常或超时，请稍后重试。",
                     color=discord.Color.red(),
                 ),
                 view=None,
@@ -422,6 +435,11 @@ class FilesCog(commands.Cog, name="文件"):
                 "❌ Bot 无权读取存储频道。", ephemeral=True
             )
             return
+        except Exception:
+            await interaction.followup.send(
+                "❌ 读取存储频道失败（网络异常），请稍后重试。", ephemeral=True
+            )
+            return
 
         if not storage_msg.attachments:
             await interaction.followup.send("❌ 存储消息中没有附件。", ephemeral=True)
@@ -429,9 +447,11 @@ class FilesCog(commands.Cog, name="文件"):
 
         attachment = storage_msg.attachments[0]
         try:
-            data = await attachment.read()
-        except discord.HTTPException:
-            await interaction.followup.send("❌ 读取文件失败，请稍后重试。", ephemeral=True)
+            data = await asyncio.wait_for(attachment.read(), timeout=180)
+        except Exception:
+            await interaction.followup.send(
+                "❌ 读取文件失败（Discord CDN 连接异常或超时），请稍后重试。", ephemeral=True
+            )
             return
 
         # ── 溯源：向本次下载的副本注入下载者标记（存储原文件不受影响） ──

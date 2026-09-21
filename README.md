@@ -133,6 +133,14 @@ discord-repo-bot/
 
 ## 📝 更新日志
 
+### v1.5.2
+
+- 🐛 修复附件读取/存储频道操作仅捕获 `HTTPException` 的问题：Discord CDN 网络异常
+  （超时、连接重置）时异常未被捕获，导致指令永久卡在「正在响应」。现统一增加
+  超时控制与全类型异常捕获，失败时明确提示
+- 📝 新增 [服务条款](TERMS_OF_SERVICE.md) 与 [隐私政策](PRIVACY_POLICY.md)，
+  可复制其 URL 配置到 Discord 开发者后台的 Bot 简介
+
 ### v1.5.1
 
 - 🐛 修复图片溯源水印的一系列问题：
@@ -190,6 +198,11 @@ discord-repo-bot/
 - ✨ 文件自动编号：上传回执、`/files`、`/search`、`/fileinfo` 均显示编号，
   相关指令可直接用编号代替文件 ID
 - 🔧 移除不必要的 Privileged Intents 申请（避免未开启时启动报错）
+
+## 📄 法律文档
+
+- [服务条款（Terms of Service）](TERMS_OF_SERVICE.md)
+- [隐私政策（Privacy Policy）](PRIVACY_POLICY.md)
 
 ## 📄 许可证
 
