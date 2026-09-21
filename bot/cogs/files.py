@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from datetime import datetime, timezone
 
 import discord
@@ -12,6 +13,196 @@ from discord.ext import commands
 from ..bot import RepoBot, fmt_size
 
 log = logging.getLogger("repo-bot")
+
+
+def build_storage_embed(
+    name: str,
+    size: int,
+    uploader: discord.User | discord.Member,
+    description: str = "",
+    has_password: bool = False,
+) -> discord.Embed:
+    """存储频道中的文件入库卡片。"""
+    embed = discord.Embed(
+        title="📦 文件入库",
+        description=description or discord.utils.escape_markdown(name),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="文件名", value=name, inline=False)
+    embed.add_field(name="大小", value=fmt_size(size), inline=True)
+    embed.add_field(
+        name="上传者", value=f"{uploader.mention} (`{uploader.id}`)", inline=True
+    )
+    if has_password:
+        embed.add_field(name="密码保护", value="🔒 下载需要密码", inline=True)
+    embed.set_footer(text="文件 ID 见入库回执")
+    return embed
+
+
+class UploadPasswordModal(discord.ui.Modal, title="🔒 设置下载密码"):
+    """上传准备阶段：设置下载密码。"""
+
+    password = discord.ui.TextInput(
+        label="下载密码",
+        placeholder="成员下载该文件时需要输入的密码",
+        min_length=1,
+        max_length=64,
+    )
+
+    def __init__(self, view: "UploadPrepView"):
+        super().__init__()
+        self._view = view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self._view.password = str(self.password.value)
+        await interaction.response.edit_message(
+            embed=self._view.make_embed(), view=self._view
+        )
+
+
+class RenameFileModal(discord.ui.Modal, title="✏️ 重命名文件"):
+    """上传准备阶段：修改入库文件名。"""
+
+    new_name = discord.ui.TextInput(label="新文件名", max_length=100)
+
+    def __init__(self, view: "UploadPrepView"):
+        super().__init__()
+        self._view = view
+        self.new_name.default = view.name
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        new = str(self.new_name.value).strip()
+        if not new or "/" in new or "\\" in new:
+            await interaction.response.send_message(
+                "❌ 文件名无效：不能为空，也不能包含 `/` 或 `\\`。",
+                ephemeral=True,
+            )
+            return
+        # 新名字没带扩展名时，自动保留原扩展名
+        old_ext = os.path.splitext(self._view.original_name)[1]
+        if old_ext and not os.path.splitext(new)[1]:
+            new += old_ext
+        self._view.name = new
+        await interaction.response.edit_message(
+            embed=self._view.make_embed(), view=self._view
+        )
+
+
+class UploadPrepView(discord.ui.View):
+    """上传准备页：设置密码 / 重命名 / 确认上传 / 取消。"""
+
+    def __init__(
+        self,
+        cog: "FilesCog",
+        guild: discord.Guild,
+        uploader: discord.User | discord.Member,
+        attachment: discord.Attachment,
+        data: bytes,
+        description: str,
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.uploader = uploader
+        self.attachment = attachment
+        self.data = data
+        self.description = description
+        self.original_name = attachment.filename
+        self.name = attachment.filename
+        self.password: str | None = None
+        self._finished = False
+
+    def make_embed(self) -> discord.Embed:
+        desc = f"📄 文件名：**{self.name}**\n💾 大小：{fmt_size(len(self.data))}\n"
+        if self.name != self.original_name:
+            desc += f"✏️ 原名：`{self.original_name}`\n"
+        desc += f"🔒 下载密码：{'已设置 ✅' if self.password else '未设置'}\n"
+        if self.description:
+            desc += f"📝 描述：{self.description}\n"
+        desc += "\n可点击「设置密码」或「重命名」调整，确认无误后点击「确认上传」。"
+        return discord.Embed(
+            title="📤 上传准备", description=desc, color=discord.Color.blurple()
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.uploader.id:
+            await interaction.response.send_message(
+                "❌ 只有上传者本人可以操作。", ephemeral=True
+            )
+            return False
+        return True
+
+    def _finish(self) -> None:
+        self._finished = True
+        self.stop()
+
+    @discord.ui.button(label="设置密码", emoji="🔒", style=discord.ButtonStyle.secondary)
+    async def set_password(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(UploadPasswordModal(self))
+
+    @discord.ui.button(label="重命名", emoji="✏️", style=discord.ButtonStyle.secondary)
+    async def rename(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RenameFileModal(self))
+
+    @discord.ui.button(label="确认上传", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._finished:
+            return
+        self._finish()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="⏳ 上传中…",
+                description=f"正在上传 **{self.name}**，请稍候。",
+                color=discord.Color.blurple(),
+            ),
+            view=None,
+        )
+        await self.cog._do_upload(interaction, self)
+
+    @discord.ui.button(label="取消", emoji="✖️", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._finished:
+            return
+        self._finish()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="已取消",
+                description="上传已取消，未写入任何内容。",
+                color=discord.Color.light_grey(),
+            ),
+            view=None,
+        )
+
+
+class DownloadPasswordModal(discord.ui.Modal, title="🔒 输入下载密码"):
+    """下载加密文件时的密码核验。"""
+
+    password = discord.ui.TextInput(label="下载密码", max_length=64)
+
+    def __init__(self, cog: "FilesCog", file_id: str):
+        super().__init__()
+        self.cog = cog
+        self.file_id = file_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        record = await self.cog.bot.db.get_file(self.file_id)
+        if record is None:
+            await interaction.response.send_message("❌ 文件已被删除。", ephemeral=True)
+            return
+        if str(self.password.value) != (record["password"] or ""):
+            await interaction.response.send_message(
+                "❌ 密码错误，下载已取消。", ephemeral=True
+            )
+            await self.cog.bot.log_admin(
+                interaction.guild,
+                interaction.user,
+                f"⚠️ 下载 `#{record['seq']} {record['name']}` 时密码错误",
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.cog._deliver_file(interaction, record)
 
 
 class FilesCog(commands.Cog, name="文件"):
@@ -30,7 +221,7 @@ class FilesCog(commands.Cog, name="文件"):
 
     # ────────────────────────── 上传 ──────────────────────────
 
-    @app_commands.command(name="upload", description="上传文件到仓库")
+    @app_commands.command(name="upload", description="上传文件到仓库（可设置密码、重命名）")
     @app_commands.describe(file="要上传的文件", description="文件描述（可选）")
     async def upload(
         self,
@@ -50,57 +241,73 @@ class FilesCog(commands.Cog, name="文件"):
             )
             return
 
-        storage, error = await self.bot.resolve_storage_channel(interaction.guild)
-        if storage is None:
-            await interaction.followup.send(f"❌ 存储频道不可用：{error}", ephemeral=True)
-            return
-
         try:
             data = await file.read()
         except discord.HTTPException:
             await interaction.followup.send("❌ 读取附件失败，请重试。", ephemeral=True)
             return
 
-        uploader = interaction.user
-        embed = discord.Embed(
-            title="📦 文件入库",
-            description=description or discord.utils.escape_markdown(file.filename),
-            color=discord.Color.blurple(),
-            timestamp=datetime.now(timezone.utc),
+        view = UploadPrepView(
+            self, interaction.guild, interaction.user, file, data, description
         )
-        embed.add_field(name="文件名", value=file.filename, inline=False)
-        embed.add_field(name="大小", value=fmt_size(file.size), inline=True)
-        embed.add_field(
-            name="上传者", value=f"{uploader.mention} (`{uploader.id}`)", inline=True
-        )
-        embed.set_footer(text="文件 ID 见入库回执")
+        await interaction.followup.send(embed=view.make_embed(), view=view, ephemeral=True)
 
+    async def _do_upload(self, interaction: discord.Interaction, prep: UploadPrepView) -> None:
+        """确认上传：写入存储频道并登记入库。"""
+        guild = prep.guild
+        storage, error = await self.bot.resolve_storage_channel(guild)
+        if storage is None:
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="❌ 存储频道不可用",
+                    description=error,
+                    color=discord.Color.red(),
+                ),
+                view=None,
+            )
+            return
+
+        uploader = prep.uploader
+        embed = build_storage_embed(
+            prep.name, len(prep.data), uploader, prep.description, prep.password is not None
+        )
         try:
             storage_msg = await storage.send(
                 embed=embed,
-                file=discord.File(io.BytesIO(data), filename=file.filename),
+                file=discord.File(io.BytesIO(prep.data), filename=prep.name),
             )
         except discord.Forbidden:
-            await interaction.followup.send(
-                "❌ Bot 没有权限向存储频道发送文件。", ephemeral=True
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="❌ 上传失败",
+                    description="Bot 没有权限向存储频道发送文件。",
+                    color=discord.Color.red(),
+                ),
+                view=None,
             )
             return
         except discord.HTTPException as exc:
-            await interaction.followup.send(
-                f"❌ 上传到存储频道失败：{exc.text or exc}", ephemeral=True
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="❌ 上传失败",
+                    description=f"上传到存储频道失败：{exc.text or exc}",
+                    color=discord.Color.red(),
+                ),
+                view=None,
             )
             return
 
         file_id, seq = await self.bot.db.add_file(
-            origin_guild_id=interaction.guild.id,
-            name=file.filename,
-            size=file.size,
-            content_type=file.content_type,
-            description=description,
+            origin_guild_id=guild.id,
+            name=prep.name,
+            size=len(prep.data),
+            content_type=prep.attachment.content_type,
+            description=prep.description,
             uploader_id=uploader.id,
             uploader_name=str(uploader),
             storage_channel_id=storage.id,
             storage_message_id=storage_msg.id,
+            password=prep.password,
         )
 
         # 回写文件 ID 到存储消息的 embed，方便管理员对照
@@ -115,21 +322,38 @@ class FilesCog(commands.Cog, name="文件"):
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc),
         )
-        log_embed.add_field(name="文件", value=f"`{file_id}` · {file.filename}", inline=False)
+        log_embed.add_field(name="文件", value=f"`{file_id}` · {prep.name}", inline=False)
         log_embed.add_field(
             name="上传者", value=f"{uploader.mention} (`{uploader.id}`)", inline=True
         )
-        log_embed.add_field(name="大小", value=fmt_size(file.size), inline=True)
-        await self.bot.send_log(interaction.guild, log_embed)
+        log_embed.add_field(name="大小", value=fmt_size(len(prep.data)), inline=True)
+        if prep.password:
+            log_embed.add_field(name="密码保护", value="🔒 是", inline=True)
+        await self.bot.send_log(guild, log_embed)
 
-        await interaction.followup.send(
-            f"✅ 上传成功！\n"
-            f"📄 文件名：`{file.filename}`\n"
+        # 管理日志：上传时重命名同步记录
+        if prep.name != prep.original_name:
+            await self.bot.log_admin(
+                guild,
+                uploader,
+                f"✏️ 上传时重命名文件：`{prep.original_name}` → `{prep.name}`（编号 `#{seq}`）",
+            )
+
+        desc = (
+            f"📄 文件名：`{prep.name}`\n"
             f"🔢 编号：`#{seq}`\n"
             f"🆔 文件 ID：`{file_id}`\n"
-            f"💾 大小：{fmt_size(file.size)}\n"
-            f"📥 下载方式：使用 `/download {seq}` 或 `/download {file_id}`",
-            ephemeral=True,
+            f"💾 大小：{fmt_size(len(prep.data))}\n"
+            f"🔒 下载密码：{'已设置' if prep.password else '无'}\n"
+            f"📥 下载方式：使用 `/download {seq}` 或 `/download {file_id}`"
+        )
+        if prep.name != prep.original_name:
+            desc += f"\n✏️ 原名：`{prep.original_name}`"
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                title="✅ 上传成功", description=desc, color=discord.Color.green()
+            ),
+            view=None,
         )
 
     # ────────────────────────── 下载（溯源核心） ──────────────────────────
@@ -138,13 +362,24 @@ class FilesCog(commands.Cog, name="文件"):
     @app_commands.describe(file_id="文件编号（如 3）或文件 ID（可用 /files 查询）")
     async def download(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None
-        await interaction.response.defer(ephemeral=True)
-
         record = await self._resolve_file(interaction.guild.id, file_id)
         if record is None:
-            await interaction.followup.send("❌ 找不到该文件，请检查编号或文件 ID。", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ 找不到该文件，请检查编号或文件 ID。", ephemeral=True
+            )
             return
+        # 加密文件：先弹窗验证密码（Modal 必须是首个响应，不能先 defer）
+        if record["password"]:
+            await interaction.response.send_modal(
+                DownloadPasswordModal(self, record["file_id"])
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self._deliver_file(interaction, record)
 
+    async def _deliver_file(self, interaction: discord.Interaction, record) -> None:
+        """从存储频道取回文件并发送，落库下载记录。调用前必须已 defer。"""
+        assert interaction.guild is not None
         storage_channel = self.bot.get_channel(record["storage_channel_id"])
         if not isinstance(storage_channel, discord.TextChannel):
             await interaction.followup.send(
@@ -307,6 +542,11 @@ class FilesCog(commands.Cog, name="文件"):
         )
         embed.add_field(name="上传时间", value=f"<t:{int(uploaded.timestamp())}:F>", inline=True)
         embed.add_field(name="下载次数", value=f"{record['download_count']} 次", inline=True)
+        embed.add_field(
+            name="密码保护",
+            value="🔒 下载需要密码" if record["password"] else "无",
+            inline=True,
+        )
         if record["description"]:
             embed.add_field(name="描述", value=record["description"], inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -380,6 +620,13 @@ class FilesCog(commands.Cog, name="文件"):
                 pass
 
         await self.bot.db.delete_file(record["file_id"])
+        if is_admin and not is_uploader:
+            await self.bot.log_admin(
+                interaction.guild,
+                interaction.user,
+                f"🗑️ 删除文件 `#{record['seq']} {record['name']}`"
+                f"（上传者 <@{record['uploader_id']}>）",
+            )
         await interaction.response.send_message(
             f"🗑️ 文件 `{record['file_id']}` · {record['name']} 已删除。",
             ephemeral=True,

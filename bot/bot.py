@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
@@ -140,6 +141,39 @@ class RepoBot(commands.Bot):
                 await channel.send(embed=embed)
             except discord.Forbidden:
                 pass
+
+    async def log_admin(
+        self,
+        guild: discord.Guild,
+        actor: discord.User | discord.Member,
+        action: str,
+    ) -> None:
+        """记录管理员操作到管理日志频道。
+
+        未单独设置管理日志频道时，跟随审计日志频道；两者都未设置则丢弃。
+        """
+        settings = await self.db.get_settings(guild.id)
+        if not settings:
+            return
+        channel_id = settings["admin_log_channel_id"] or settings["log_channel_id"]
+        if not channel_id:
+            return
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        embed = discord.Embed(
+            title="🛡️ 管理日志",
+            description=action,
+            color=discord.Color.dark_gold(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(
+            name=f"{actor} ({actor.id})", icon_url=actor.display_avatar.url
+        )
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            pass
 
 
 def fmt_size(num: int) -> str:

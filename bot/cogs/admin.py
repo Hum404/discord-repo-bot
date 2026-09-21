@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..bot import STORAGE_CHANNEL_NAME, RepoBot, fmt_size
+from .files import build_storage_embed
 
 log = logging.getLogger("repo-bot")
 
@@ -29,6 +30,7 @@ class OrganizeVoteView(discord.ui.View):
         guild: discord.Guild,
         scope_label: str,
         channel_ids: set[int] | None,
+        scan_channel_ids: set[int] | None,
         required: int,
         initiator: discord.Member,
     ):
@@ -37,6 +39,7 @@ class OrganizeVoteView(discord.ui.View):
         self.guild = guild
         self.scope_label = scope_label
         self.channel_ids = channel_ids
+        self.scan_channel_ids = scan_channel_ids
         self.required = required
         self.initiator = initiator
         self.voters: set[int] = {initiator.id}
@@ -115,11 +118,21 @@ class OrganizeVoteView(discord.ui.View):
     async def _run(self) -> None:
         self.cog._organizing.add(self.guild.id)
         try:
-            stats = await self.cog.run_organize(self.guild, self.channel_ids, self.message)
+            stats = await self.cog.run_organize(
+                self.guild, self.channel_ids, self.scan_channel_ids, self.message
+            )
             desc = (
                 f"范围：**{self.scope_label}**\n"
                 f"📦 已归拢文件：**{stats['moved']}** 个\n"
+                f"📝 新登记（本就在存储频道）：{stats['registered']} 个\n"
                 f"⏭️ 无需移动：{stats['skipped']} 个"
+            )
+            await self.cog.bot.log_admin(
+                self.guild,
+                self.initiator,
+                f"🗂️ 整理完成（{self.scope_label}）：归拢 {stats['moved']} · "
+                f"新登记 {stats['registered']} · 无需移动 {stats['skipped']} · "
+                f"失败 {stats['failed']}",
             )
             if stats["failed"]:
                 desc += f"\n⚠️ 失败 {stats['failed']} 个（详情见运行日志）"
@@ -199,6 +212,11 @@ class AdminCog(commands.Cog, name="管理"):
                 storage_category_id=category.id, storage_channel_id=channel.id
             )
             await self.bot.db.upsert_settings(interaction.guild.id, **fields)
+            await self.bot.log_admin(
+                interaction.guild,
+                interaction.user,
+                f"⚙️ 存储模式 → 当前服务器子区（「{category.name}」→ {channel.mention}）",
+            )
             await interaction.followup.send(
                 f"✅ 存储模式已设置为 **当前服务器子区**\n"
                 f"📁 存储位置：使用现有子区「**{category.name}**」→ {channel.mention}",
@@ -244,6 +262,11 @@ class AdminCog(commands.Cog, name="管理"):
             return
 
         mode_text = "当前服务器子区" if mode.value == "category" else "独立存储服务器"
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            f"⚙️ 存储模式 → {mode_text}（{storage.guild.name} → #{storage.name}）",
+        )
         await interaction.followup.send(
             f"✅ 存储模式已设置为 **{mode_text}**\n"
             f"📁 存储位置：{storage.guild.name} → #{storage.name}",
@@ -264,12 +287,43 @@ class AdminCog(commands.Cog, name="管理"):
         await self.bot.db.upsert_settings(
             interaction.guild.id, log_channel_id=channel.id if channel else None
         )
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            f"⚙️ 审计日志频道 → {channel.mention if channel else '关闭'}",
+        )
         if channel:
             await interaction.response.send_message(
                 f"✅ 审计日志将发送到 {channel.mention}。", ephemeral=True
             )
         else:
             await interaction.response.send_message("✅ 已关闭审计日志。", ephemeral=True)
+
+    @app_commands.command(name="admin_log_channel", description="设置管理日志频道（管理员）")
+    @app_commands.describe(channel="管理日志发送到的频道；不填则跟随审计日志频道")
+    @admin_only
+    async def admin_log_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ):
+        assert interaction.guild is not None
+        await self.bot.db.upsert_settings(
+            interaction.guild.id, admin_log_channel_id=channel.id if channel else None
+        )
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            f"⚙️ 管理日志频道 → {channel.mention if channel else '跟随审计日志频道'}",
+        )
+        if channel:
+            await interaction.response.send_message(
+                f"✅ 管理日志将发送到 {channel.mention}。", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "✅ 管理日志已改为跟随审计日志频道。", ephemeral=True
+            )
 
     # ───────────────────── 用户下载审计 ─────────────────────
 
@@ -280,6 +334,11 @@ class AdminCog(commands.Cog, name="管理"):
         self, interaction: discord.Interaction, member: discord.Member
     ):
         assert interaction.guild is not None
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            f"🕵️ 查询成员下载记录：{member} (`{member.id}`)",
+        )
         rows = await self.bot.db.get_user_downloads(interaction.guild.id, member.id)
         embed = discord.Embed(
             title=f"🕵️ 成员下载审计：{member} (`{member.id}`)",
@@ -349,12 +408,12 @@ class AdminCog(commands.Cog, name="管理"):
             return
 
         if scope.value == "category":
-            cat = (
+            business_cat = (
                 interaction.channel.category
                 if isinstance(interaction.channel, discord.TextChannel)
                 else None
             )
-            if cat is None:
+            if business_cat is None:
                 await interaction.response.send_message(
                     "❌ 无法确定子区：请在目标子区（分类）内的文字频道中使用本指令。",
                     ephemeral=True,
@@ -362,46 +421,79 @@ class AdminCog(commands.Cog, name="管理"):
                 return
             # 独立存储服务器模式：在存储服务器中按同名子区匹配
             settings = await self.bot.db.get_settings(interaction.guild.id)
+            cat = business_cat
             if settings and settings["storage_mode"] == "guild" and settings["storage_guild_id"]:
                 storage_guild = self.bot.get_guild(settings["storage_guild_id"])
                 target_cat = (
-                    discord.utils.get(storage_guild.categories, name=cat.name)
+                    discord.utils.get(storage_guild.categories, name=business_cat.name)
                     if storage_guild
                     else None
                 )
                 if target_cat is None:
                     await interaction.response.send_message(
-                        f"❌ 存储服务器中不存在同名子区「{cat.name}」。", ephemeral=True
+                        f"❌ 存储服务器中不存在同名子区「{business_cat.name}」。", ephemeral=True
                     )
                     return
                 cat = target_cat
+            # 迁移过滤用存储侧频道；扫描散落文件用业务侧频道
             channel_ids = {c.id for c in cat.text_channels}
+            scan_channel_ids = {c.id for c in business_cat.text_channels}
             required = ORGANIZE_VOTES_CATEGORY
-            scope_label = f"当前子区「{cat.name}」"
+            scope_label = f"当前子区「{business_cat.name}」"
         else:
             channel_ids = None
+            scan_channel_ids = None
             required = ORGANIZE_VOTES_GUILD
             scope_label = "整个服务器"
 
         view = OrganizeVoteView(
-            self, interaction.guild, scope_label, channel_ids, required, interaction.user
+            self, interaction.guild, scope_label, channel_ids, scan_channel_ids,
+            required, interaction.user,
         )
         await interaction.response.send_message(embed=view.make_embed("🗂️ 整理投票"), view=view)
         view.message = await interaction.original_response()
+        await self.bot.log_admin(
+            interaction.guild, interaction.user, f"🗳️ 发起整理投票（{scope_label}）"
+        )
 
     async def run_organize(
         self,
         guild: discord.Guild,
         channel_ids: set[int] | None,
+        scan_channel_ids: set[int] | None,
         message: discord.Message | None,
     ) -> dict:
-        """把范围内文件的存储消息迁移到当前配置的存储频道，并更新索引。"""
+        """整理存储文件，分两阶段：
+
+        ① 迁移：已登记但不在当前存储频道的文件，搬运到存储频道并更新索引；
+        ② 扫描：范围内频道里未登记的文件消息（成员直接发的），登记入库并
+           搬入存储频道；本就在存储频道的单附件消息原地登记。
+        """
         storage, error = await self.bot.resolve_storage_channel(guild)
         if storage is None:
             raise RuntimeError(f"存储频道不可用：{error}")
 
         files = await self.bot.db.list_all_files(guild.id)
-        stats = {"moved": 0, "skipped": 0, "failed": 0}
+        tracked = {(r["storage_channel_id"], r["storage_message_id"]) for r in files}
+        stats = {"moved": 0, "registered": 0, "skipped": 0, "failed": 0}
+        size_limit = self.bot.config.max_file_size_mb * 1024 * 1024
+
+        async def report_progress(text: str) -> None:
+            if message is None:
+                return
+            try:
+                await message.edit(
+                    embed=discord.Embed(
+                        title="🗂️ 正在整理…",
+                        description=text,
+                        color=discord.Color.blurple(),
+                    )
+                )
+            except discord.HTTPException:
+                pass
+
+        # ── 阶段 1：迁移已登记但不在存储频道的文件 ──
+        total = len(files)
         for i, row in enumerate(files, 1):
             if channel_ids is not None and row["storage_channel_id"] not in channel_ids:
                 stats["skipped"] += 1
@@ -422,22 +514,113 @@ class AdminCog(commands.Cog, name="管理"):
                     file=discord.File(io.BytesIO(data), filename=row["name"]),
                 )
                 await self.bot.db.update_file_storage(row["file_id"], storage.id, new_msg.id)
+                tracked.add((storage.id, new_msg.id))
                 await src_msg.delete()
                 stats["moved"] += 1
             except Exception:
                 log.exception("整理文件失败 file_id=%s", row["file_id"])
                 stats["failed"] += 1
-            if message is not None and i % 5 == 0:
-                try:
-                    await message.edit(
-                        embed=discord.Embed(
-                            title="🗂️ 正在整理…",
-                            description=f"进度：**{i}/{len(files)}** 个文件",
-                            color=discord.Color.blurple(),
+            if i % 5 == 0:
+                await report_progress(f"阶段 1/2 迁移已登记文件：**{i}/{total}**")
+
+        # ── 阶段 2：扫描范围内频道，登记未入库的散落文件 ──
+        if scan_channel_ids is None:
+            scan_channels: list[discord.TextChannel] = list(guild.text_channels)
+        else:
+            scan_channels = [
+                ch
+                for cid in scan_channel_ids
+                if isinstance((ch := guild.get_channel(cid)), discord.TextChannel)
+            ]
+
+        me = self.bot.user
+        scanned = 0
+        for ch in scan_channels:
+            try:
+                async for msg in ch.history(limit=None, oldest_first=True):
+                    if not msg.attachments or (me is not None and msg.author.id == me.id):
+                        continue
+                    if (ch.id, msg.id) in tracked:
+                        continue
+                    # 本就在存储频道的单附件消息：原地登记，无需搬运
+                    in_place = ch.id == storage.id and len(msg.attachments) == 1
+                    all_ok = True
+                    for att in msg.attachments:
+                        if att.size > size_limit:
+                            log.warning(
+                                "整理跳过超大文件：%s (%s B)", att.filename, att.size
+                            )
+                            stats["failed"] += 1
+                            all_ok = False
+                            continue
+                        try:
+                            data = await att.read()
+                            description = (msg.content or "").strip()[:200]
+                            if in_place:
+                                await self.bot.db.add_file(
+                                    origin_guild_id=guild.id,
+                                    name=att.filename,
+                                    size=att.size,
+                                    content_type=att.content_type,
+                                    description=description,
+                                    uploader_id=msg.author.id,
+                                    uploader_name=str(msg.author),
+                                    storage_channel_id=ch.id,
+                                    storage_message_id=msg.id,
+                                    uploaded_at=int(msg.created_at.timestamp()),
+                                )
+                                stats["registered"] += 1
+                            else:
+                                embed = build_storage_embed(
+                                    att.filename, att.size, msg.author, description
+                                )
+                                new_msg = await storage.send(
+                                    embed=embed,
+                                    file=discord.File(
+                                        io.BytesIO(data), filename=att.filename
+                                    ),
+                                )
+                                file_id, seq = await self.bot.db.add_file(
+                                    origin_guild_id=guild.id,
+                                    name=att.filename,
+                                    size=att.size,
+                                    content_type=att.content_type,
+                                    description=description,
+                                    uploader_id=msg.author.id,
+                                    uploader_name=str(msg.author),
+                                    storage_channel_id=storage.id,
+                                    storage_message_id=new_msg.id,
+                                    uploaded_at=int(msg.created_at.timestamp()),
+                                )
+                                embed.set_footer(
+                                    text=f"编号 #{seq} · 文件 ID：{file_id}"
+                                )
+                                try:
+                                    await new_msg.edit(embed=embed)
+                                except discord.HTTPException:
+                                    pass
+                                tracked.add((storage.id, new_msg.id))
+                                stats["moved"] += 1
+                        except Exception:
+                            log.exception("整理登记文件失败 msg=%s", msg.id)
+                            stats["failed"] += 1
+                            all_ok = False
+                    # 附件全部入库后删除原消息（原地登记的除外）
+                    if not in_place and all_ok:
+                        try:
+                            await msg.delete()
+                        except discord.HTTPException:
+                            pass
+                    tracked.add((ch.id, msg.id))
+                    scanned += 1
+                    if scanned % 10 == 0:
+                        await report_progress(
+                            f"阶段 2/2 扫描散落文件：已处理 **{scanned}** 条消息\n"
+                            f"已归拢 {stats['moved']} · 新登记 {stats['registered']} · "
+                            f"失败 {stats['failed']}"
                         )
-                    )
-                except discord.HTTPException:
-                    pass
+            except discord.Forbidden:
+                log.warning("整理：无权读取频道 #%s 的历史，已跳过", ch.name)
         return stats
 
 
