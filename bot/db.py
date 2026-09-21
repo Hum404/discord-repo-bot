@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS files (
     storage_message_id INTEGER NOT NULL,
     download_count     INTEGER NOT NULL DEFAULT 0,
     password           TEXT,
+    trace_enabled      INTEGER NOT NULL DEFAULT 1,
     seq                INTEGER
 );
 
@@ -78,6 +79,7 @@ class Database:
         for migration in (
             "ALTER TABLE files ADD COLUMN seq INTEGER",
             "ALTER TABLE files ADD COLUMN password TEXT",
+            "ALTER TABLE files ADD COLUMN trace_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE settings ADD COLUMN admin_log_channel_id INTEGER",
         ):
             try:
@@ -157,6 +159,7 @@ class Database:
         storage_channel_id: int,
         storage_message_id: int,
         password: str | None = None,
+        trace_enabled: bool = True,
         uploaded_at: int | None = None,
     ) -> tuple[str, int]:
         file_id = new_file_id()
@@ -171,8 +174,8 @@ class Database:
                 INSERT INTO files (
                     file_id, origin_guild_id, name, size, content_type, description,
                     uploader_id, uploader_name, uploaded_at,
-                    storage_channel_id, storage_message_id, password, seq
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    storage_channel_id, storage_message_id, password, trace_enabled, seq
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     file_id,
@@ -187,6 +190,7 @@ class Database:
                     storage_channel_id,
                     storage_message_id,
                     password,
+                    int(trace_enabled),
                     seq,
                 ),
             )

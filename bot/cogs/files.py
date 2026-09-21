@@ -112,6 +112,7 @@ class UploadPrepView(discord.ui.View):
         self.original_name = attachment.filename
         self.name = attachment.filename
         self.password: str | None = None
+        self.trace_enabled = True
         self._finished = False
 
     def make_embed(self) -> discord.Embed:
@@ -119,9 +120,14 @@ class UploadPrepView(discord.ui.View):
         if self.name != self.original_name:
             desc += f"✏️ 原名：`{self.original_name}`\n"
         desc += f"🔒 下载密码：{'已设置 ✅' if self.password else '未设置'}\n"
+        desc += (
+            "🔖 下载溯源标记：开启 ✅（下载副本会嵌入下载者标记）\n"
+            if self.trace_enabled
+            else "🔖 下载溯源标记：关闭（下载副本不嵌入标记）\n"
+        )
         if self.description:
             desc += f"📝 描述：{self.description}\n"
-        desc += "\n可点击「设置密码」或「重命名」调整，确认无误后点击「确认上传」。"
+        desc += "\n可点击「设置密码」「重命名」「溯源开关」调整，确认无误后点击「确认上传」。"
         return discord.Embed(
             title="📤 上传准备", description=desc, color=discord.Color.blurple()
         )
@@ -145,6 +151,11 @@ class UploadPrepView(discord.ui.View):
     @discord.ui.button(label="重命名", emoji="✏️", style=discord.ButtonStyle.secondary)
     async def rename(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RenameFileModal(self))
+
+    @discord.ui.button(label="溯源开关", emoji="🔖", style=discord.ButtonStyle.secondary)
+    async def toggle_trace(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.trace_enabled = not self.trace_enabled
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
     @discord.ui.button(label="确认上传", emoji="✅", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -309,6 +320,7 @@ class FilesCog(commands.Cog, name="文件"):
             storage_channel_id=storage.id,
             storage_message_id=storage_msg.id,
             password=prep.password,
+            trace_enabled=prep.trace_enabled,
         )
 
         # 回写文件 ID 到存储消息的 embed，方便管理员对照
@@ -330,14 +342,22 @@ class FilesCog(commands.Cog, name="文件"):
         log_embed.add_field(name="大小", value=fmt_size(len(prep.data)), inline=True)
         if prep.password:
             log_embed.add_field(name="密码保护", value="🔒 是", inline=True)
+        if not prep.trace_enabled:
+            log_embed.add_field(name="溯源标记", value="已关闭 ⚠️", inline=True)
         await self.bot.send_log(guild, log_embed)
 
-        # 管理日志：上传时重命名同步记录
+        # 管理日志：上传时重命名 / 关闭溯源，均同步记录
         if prep.name != prep.original_name:
             await self.bot.log_admin(
                 guild,
                 uploader,
                 f"✏️ 上传时重命名文件：`{prep.original_name}` → `{prep.name}`（编号 `#{seq}`）",
+            )
+        if not prep.trace_enabled:
+            await self.bot.log_admin(
+                guild,
+                uploader,
+                f"⚠️ 上传时关闭了溯源标记：`{prep.name}`（编号 `#{seq}`）",
             )
 
         desc = (
@@ -346,6 +366,7 @@ class FilesCog(commands.Cog, name="文件"):
             f"🆔 文件 ID：`{file_id}`\n"
             f"💾 大小：{fmt_size(len(prep.data))}\n"
             f"🔒 下载密码：{'已设置' if prep.password else '无'}\n"
+            f"🔖 溯源标记：{'开启' if prep.trace_enabled else '关闭'}\n"
             f"📥 下载方式：使用 `/download {seq}` 或 `/download {file_id}`"
         )
         if prep.name != prep.original_name:
@@ -414,9 +435,12 @@ class FilesCog(commands.Cog, name="文件"):
 
         # ── 溯源：向本次下载的副本注入下载者标记（存储原文件不受影响） ──
         user = interaction.user
-        data, traced = inject_trace(
-            data, record["name"], user.id, str(user), record["content_type"]
-        )
+        if record["trace_enabled"]:
+            data, traced = inject_trace(
+                data, record["name"], user.id, str(user), record["content_type"]
+            )
+        else:
+            traced = False
 
         # ── 溯源：先落库，再发文件 ──
         await self.bot.db.log_download(
@@ -554,6 +578,11 @@ class FilesCog(commands.Cog, name="文件"):
         embed.add_field(
             name="密码保护",
             value="🔒 下载需要密码" if record["password"] else "无",
+            inline=True,
+        )
+        embed.add_field(
+            name="溯源标记",
+            value="🔖 开启" if record["trace_enabled"] else "关闭",
             inline=True,
         )
         if record["description"]:
