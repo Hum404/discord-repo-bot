@@ -981,6 +981,13 @@ class AdminCog(commands.Cog, name="管理"):
     @admin_only
     async def organize_filter(self, interaction: discord.Interaction):
         assert interaction.guild is not None
+        if not hasattr(discord.ui, "ChannelSelect"):
+            await interaction.response.send_message(
+                "❌ 服务器的 discord.py 版本过低（本功能需要 ≥ 2.4）。\n"
+                "请执行 `pip install -U discord.py` 后重启 Bot。",
+                ephemeral=True,
+            )
+            return
         mode, channel_ids = await self.bot.db.get_organize_filter(interaction.guild.id)
         view = OrganizeFilterView(self.bot, interaction.guild, mode, channel_ids)
         await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
