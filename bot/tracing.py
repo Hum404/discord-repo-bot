@@ -100,7 +100,18 @@ def _extract_zip(data: bytes) -> tuple[str, str] | None:
 # ───────────────────── 图片水印 ─────────────────────
 
 
+# 超过此像素数跳过水印：避免大图处理数十秒 / 撑爆内存
+MAX_WATERMARK_PIXELS = 30_000_000
+# 水印输出超过此大小则放弃注入：保证文件始终能送达（Discord 上限约 25MB）
+MAX_WATERMARK_OUTPUT = 20 * 1024 * 1024
+
+
 def _load_font(size: int):
+    """加载字体。返回 (字体, 是否已是目标大小)。
+
+    依次尝试常见系统字体 → Pillow 可缩放默认字体（≥10.1，需 freetype）→
+    位图默认字体（固定小字号，调用方负责放大）。
+    """
     for path in (
         "DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -110,13 +121,17 @@ def _load_font(size: int):
         "C:/Windows/Fonts/arial.ttf",
     ):
         try:
-            return ImageFont.truetype(path, size)
+            return ImageFont.truetype(path, size), True
         except (OSError, IOError):
             continue
     try:
-        return ImageFont.load_default(size=size)  # Pillow ≥ 10.1
-    except TypeError:
-        return ImageFont.load_default()
+        return ImageFont.load_default(size=size), True
+    except (TypeError, ImportError):
+        # 老版本 Pillow（无 size 参数）或未编译 freetype
+        try:
+            return ImageFont.load_default(), False
+        except Exception:
+            return None, False
 
 
 def _inject_image(data: bytes, user_id: int, user_name: str, ts: int) -> bytes | None:
@@ -126,37 +141,65 @@ def _inject_image(data: bytes, user_id: int, user_name: str, ts: int) -> bytes |
         img = Image.open(io.BytesIO(data))
         if getattr(img, "is_animated", False):  # 动图跳过，避免破坏动画
             return None
-        fmt = img.format or "PNG"
-        img = img.convert("RGBA")
-        w, h = img.size
-        if w < 80 or h < 80:
+        fmt = (img.format or "").upper()
+        if fmt not in {"PNG", "JPEG", "JPG", "BMP", "WEBP", "GIF"}:
             return None
+        w, h = img.size
+        if w < 80 or h < 80 or w * h > MAX_WATERMARK_PIXELS:
+            return None
+        img = img.convert("RGBA")
 
         date = time.strftime("%m-%d %H:%M", time.localtime(ts))
         # 系统字体不一定支持中文，用户名含非 ASCII 时只打水印 ID
         name_part = f"{user_name} " if user_name.isascii() else ""
         text = f"{name_part}ID:{user_id} {date}"
+        target = max(14, min(w, h) // 32)
 
-        size = max(14, min(w, h) // 32)
-        font = _load_font(size)
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        margin = max(6, min(w, h) // 60)
-        x, y = w - tw - margin, h - th - margin
-        # 黑色描边 + 半透明白字，深浅背景都可读
+        loaded = _load_font(target)
+        if loaded[0] is None:
+            return None
+        font, _ = loaded
+
+        # 先在独立贴图上绘制文字（含描边），再贴到右下角
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        bbox = probe.textbbox((0, 0), text, font=font)
+        tw, th = max(bbox[2] - bbox[0], 1), max(bbox[3] - bbox[1], 1)
+        pad = max(2, target // 8)
+        tile = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+        tdraw = ImageDraw.Draw(tile)
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 160))
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 190))
-        out_img = Image.alpha_composite(img, overlay)
+            tdraw.text((pad + dx, pad + dy), text, font=font, fill=(0, 0, 0, 170))
+        tdraw.text((pad, pad), text, font=font, fill=(255, 255, 255, 200))
+        # 位图默认字体不会随 size 放大：整体放大贴图保证水印可见
+        if th < target * 0.6:
+            scale = target / th
+            tile = tile.resize(
+                (max(int(tile.width * scale), 1), max(int(tile.height * scale), 1)),
+                Image.LANCZOS,
+            )
+
+        margin = max(6, min(w, h) // 60)
+        x = max(w - tile.width - margin, 0)
+        y = max(h - tile.height - margin, 0)
+        img.alpha_composite(tile, (x, y))
 
         bio = io.BytesIO()
-        if fmt in ("JPEG", "JPG", "BMP"):
-            out_img.convert("RGB").save(bio, format=fmt, quality=92)
+        if fmt in ("JPEG", "JPG"):
+            img.convert("RGB").save(bio, format="JPEG", quality=90)
+        elif fmt == "BMP":
+            img.convert("RGB").save(bio, format="BMP")
+        elif fmt == "GIF":
+            img.convert("P", palette=Image.ADAPTIVE).save(bio, format="GIF")
+        elif fmt == "WEBP":
+            img.save(bio, format="WEBP", quality=92)
         else:
-            out_img.save(bio, format=fmt)
-        return bio.getvalue()
+            # compress_level=1：重编码提速数倍（默认 6 对大 PNG 极慢）
+            img.save(bio, format="PNG", compress_level=1)
+        out = bio.getvalue()
+        if len(out) > MAX_WATERMARK_OUTPUT:
+            log.warning("水印输出过大（%d B），跳过注入以保证送达", len(out))
+            return None
+        return out
     except Exception:
         log.exception("图片水印注入失败")
         return None

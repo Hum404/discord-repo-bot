@@ -1,6 +1,7 @@
 """文件相关指令：上传 / 下载（含溯源）/ 列表 / 搜索 / 详情 / 历史 / 删除。"""
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -434,10 +435,12 @@ class FilesCog(commands.Cog, name="文件"):
             return
 
         # ── 溯源：向本次下载的副本注入下载者标记（存储原文件不受影响） ──
+        # 图片水印是 CPU 密集操作，放到线程里执行，避免阻塞事件循环
         user = interaction.user
         if record["trace_enabled"]:
-            data, traced = inject_trace(
-                data, record["name"], user.id, str(user), record["content_type"]
+            data, traced = await asyncio.to_thread(
+                inject_trace,
+                data, record["name"], user.id, str(user), record["content_type"],
             )
         else:
             traced = False
