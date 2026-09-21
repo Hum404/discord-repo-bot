@@ -242,6 +242,31 @@ class Database:
         await self.conn.execute("DELETE FROM downloads WHERE file_id = ?", (file_id,))
         await self.conn.commit()
 
+    async def purge_guild(self, guild_id: int) -> dict:
+        """初始化：清空某服务器的全部文件记录、下载记录与设置。返回统计。"""
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE origin_guild_id = ?", (guild_id,)
+        )
+        files_n = (await cur.fetchone())[0]
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) FROM downloads WHERE guild_id = ?", (guild_id,)
+        )
+        dl_n = (await cur.fetchone())[0]
+        async with self._write_lock:
+            await self.conn.execute(
+                "DELETE FROM downloads WHERE guild_id = ? OR file_id IN "
+                "(SELECT file_id FROM files WHERE origin_guild_id = ?)",
+                (guild_id, guild_id),
+            )
+            await self.conn.execute(
+                "DELETE FROM files WHERE origin_guild_id = ?", (guild_id,)
+            )
+            await self.conn.execute(
+                "DELETE FROM settings WHERE guild_id = ?", (guild_id,)
+            )
+            await self.conn.commit()
+        return {"files": files_n, "downloads": dl_n}
+
     async def list_all_files(self, guild_id: int) -> list[aiosqlite.Row]:
         """不限量取出本服务器全部文件（供整理使用）。"""
         cur = await self.conn.execute(

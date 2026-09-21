@@ -21,6 +21,9 @@ admin_only = app_commands.checks.has_permissions(administrator=True)
 ORGANIZE_VOTES_CATEGORY = 2
 ORGANIZE_VOTES_GUILD = 3
 
+# /reset_server 初始化通过所需的管理员同意人数
+RESET_VOTES_REQUIRED = 3
+
 
 class OrganizeVoteView(discord.ui.View):
     """整理投票：集齐所需数量的管理员同意后自动执行整理。"""
@@ -151,6 +154,146 @@ class OrganizeVoteView(discord.ui.View):
                     await self.message.edit(
                         embed=discord.Embed(
                             title="❌ 整理失败", description=str(exc), color=discord.Color.red()
+                        ),
+                        view=None,
+                    )
+                except discord.HTTPException:
+                    pass
+        finally:
+            self.cog._organizing.discard(self.guild.id)
+
+
+class ResetVoteView(discord.ui.View):
+    """初始化投票：集齐 3 名管理员同意后执行服务器初始化。"""
+
+    def __init__(
+        self,
+        cog: "AdminCog",
+        guild: discord.Guild,
+        initiator: discord.Member,
+        delete_files: bool,
+    ):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.guild = guild
+        self.initiator = initiator
+        self.delete_files = delete_files
+        self.required = RESET_VOTES_REQUIRED
+        self.voters: set[int] = {initiator.id}
+        self.message: discord.Message | None = None
+
+    @property
+    def mode_label(self) -> str:
+        return (
+            "彻底重置（同时删除存储频道及其中所有文件）"
+            if self.delete_files
+            else "仅清空数据（保留存储频道，之后可 /organize 重新登记）"
+        )
+
+    def make_embed(self, title: str, color: discord.Color | None = None) -> discord.Embed:
+        voters = "、".join(f"<@{v}>" for v in self.voters)
+        return discord.Embed(
+            title=title,
+            description=(
+                "⚠️ **高危操作，执行后不可撤销**\n"
+                f"模式：**{self.mode_label}**\n"
+                "将清空：全部文件记录、全部下载记录、服务器设置（存储/日志配置）\n"
+                "执行后 Bot 恢复到刚加入服务器时的状态\n\n"
+                f"发起者：{self.initiator.mention}（自动计 1 票）\n"
+                f"所需同意：**{self.required}** 名管理员\n"
+                f"当前票数：**{len(self.voters)}/{self.required}**　{voters}\n"
+                "⏳ 投票 10 分钟内有效"
+            ),
+            color=color or discord.Color.red(),
+        )
+
+    def _disable(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="同意初始化", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 只有管理员才能投票。", ephemeral=True)
+            return
+        if interaction.user.id in self.voters:
+            await interaction.response.send_message("你已经投过同意了。", ephemeral=True)
+            return
+        self.voters.add(interaction.user.id)
+        if len(self.voters) >= self.required:
+            self._disable()
+            await interaction.response.edit_message(
+                embed=self.make_embed("⚠️ 投票通过，开始初始化…"), view=self
+            )
+            self.stop()
+            asyncio.create_task(self._run())
+        else:
+            await interaction.response.edit_message(
+                embed=self.make_embed("⚠️ 初始化投票"), view=self
+            )
+
+    @discord.ui.button(label="取消", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.initiator.id and (
+            not isinstance(interaction.user, discord.Member)
+            or not interaction.user.guild_permissions.administrator
+        ):
+            await interaction.response.send_message("❌ 只有发起者或管理员可以取消。", ephemeral=True)
+            return
+        self._disable()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="已取消",
+                description="初始化投票已被取消，未执行任何操作。",
+                color=discord.Color.light_grey(),
+            ),
+            view=self,
+        )
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        if self.message:
+            try:
+                await self.message.edit(
+                    embed=discord.Embed(
+                        title="投票超时",
+                        description="10 分钟内未集齐同意票，初始化已取消。",
+                        color=discord.Color.light_grey(),
+                    ),
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+
+    async def _run(self) -> None:
+        self.cog._organizing.add(self.guild.id)  # 复用执行锁，避免与整理并发
+        try:
+            stats = await self.cog.run_reset(self.guild, self.delete_files)
+            desc = (
+                f"模式：**{self.mode_label}**\n"
+                f"🗑️ 文件记录：已清除 **{stats['files']}** 条\n"
+                f"🧾 下载记录：已清除 **{stats['downloads']}** 条\n"
+                "⚙️ 服务器设置：已清除\n"
+                f"📁 存储频道：{'已删除' if stats['channel_deleted'] else '未删除'}\n\n"
+                "✅ Bot 已恢复到刚加入服务器时的状态，下次 `/upload` 将重新初始化存储。"
+            )
+            if self.message:
+                try:
+                    await self.message.edit(
+                        embed=discord.Embed(
+                            title="✅ 初始化完成", description=desc, color=discord.Color.green()
+                        ),
+                        view=None,
+                    )
+                except discord.HTTPException:
+                    pass  # 投票消息所在频道可能已随存储频道一起被删除
+        except Exception as exc:
+            log.exception("初始化执行失败")
+            if self.message:
+                try:
+                    await self.message.edit(
+                        embed=discord.Embed(
+                            title="❌ 初始化失败", description=str(exc), color=discord.Color.red()
                         ),
                         view=None,
                     )
@@ -666,6 +809,94 @@ class AdminCog(commands.Cog, name="管理"):
                         )
             except discord.Forbidden:
                 log.warning("整理：无权读取频道 #%s 的历史，已跳过", ch.name)
+        return stats
+
+    # ───────────────────── 初始化本服务器（投票制） ─────────────────────
+
+    @app_commands.command(
+        name="reset_server",
+        description="初始化本服务器：清空数据，Bot 恢复到刚加入时的状态（需 3 名管理员同意）",
+    )
+    @app_commands.describe(mode="初始化模式")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="仅清空数据（保留存储频道，之后可重新登记）", value="data"),
+            app_commands.Choice(name="彻底重置（同时删除存储频道及其中所有文件）", value="full"),
+        ]
+    )
+    @admin_only
+    async def reset_server(self, interaction: discord.Interaction, mode: app_commands.Choice[str]):
+        assert interaction.guild is not None and isinstance(interaction.user, discord.Member)
+        if interaction.guild.id in self._organizing:
+            await interaction.response.send_message(
+                "❌ 当前已有整理/初始化任务在执行，请等待其完成。", ephemeral=True
+            )
+            return
+        view = ResetVoteView(
+            self, interaction.guild, interaction.user, delete_files=(mode.value == "full")
+        )
+        await interaction.response.send_message(
+            embed=view.make_embed("⚠️ 初始化投票"), view=view
+        )
+        view.message = await interaction.original_response()
+        await self.bot.log_admin(
+            interaction.guild, interaction.user, f"⚠️ 发起初始化投票（{view.mode_label}）"
+        )
+
+    async def run_reset(self, guild: discord.Guild, delete_files: bool) -> dict:
+        """执行初始化：可选删除存储频道，然后清空本服全部数据与设置。"""
+        settings = await self.bot.db.get_settings(guild.id)
+
+        # 设置即将被清除，先拿到日志频道对象，完事后再发最后一条管理日志
+        log_ch = None
+        if settings:
+            cid = settings["admin_log_channel_id"] or settings["log_channel_id"]
+            if cid:
+                ch = guild.get_channel(cid)
+                if isinstance(ch, discord.TextChannel):
+                    log_ch = ch
+
+        channel_deleted = False
+        if delete_files and settings and settings["storage_channel_id"]:
+            ch = self.bot.get_channel(settings["storage_channel_id"])
+            if isinstance(ch, discord.TextChannel):
+                cat = ch.category
+                try:
+                    await ch.delete()
+                    channel_deleted = True
+                except (discord.Forbidden, discord.HTTPException):
+                    log.warning("初始化：删除存储频道失败", exc_info=True)
+                # Bot 自动创建的专用分类空了一并删除；管理员自建的分类不动
+                if (
+                    channel_deleted
+                    and cat is not None
+                    and cat.name == STORAGE_CATEGORY_NAME
+                    and len(cat.channels) == 0
+                ):
+                    try:
+                        await cat.delete()
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+        stats = await self.bot.db.purge_guild(guild.id)
+        stats["channel_deleted"] = channel_deleted
+
+        if log_ch is not None:
+            try:
+                await log_ch.send(
+                    embed=discord.Embed(
+                        title="🛡️ 管理日志",
+                        description=(
+                            f"⚠️ **服务器已初始化**\n"
+                            f"清除文件记录 {stats['files']} 条 · 下载记录 {stats['downloads']} 条\n"
+                            f"{'存储频道已删除' if channel_deleted else '存储频道已保留'}\n"
+                            "本日志频道的绑定已随设置一并清除，此为最后一条管理日志。"
+                        ),
+                        color=discord.Color.dark_gold(),
+                    )
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
         return stats
 
 
