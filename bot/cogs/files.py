@@ -1,6 +1,7 @@
 """文件相关指令：上传 / 下载 / 列表 / 搜索 / 详情 / 历史 / 删除。"""
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
