@@ -4,10 +4,16 @@
 - files     : 文件元数据 + 存储消息定位
 - downloads : 每一次下载行为（溯源核心）
 - settings  : 每个业务服务器的存储配置
+
+风控相关：
+- bans            : 风控封禁（到期自动解除）
+- download_events : 近期下载行为流水（用于频率判定）
+- appeals         : 解封申诉工单
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -52,8 +58,42 @@ CREATE TABLE IF NOT EXISTS settings (
     storage_category_id  INTEGER,
     storage_channel_id   INTEGER,
     log_channel_id       INTEGER,
-    admin_log_channel_id INTEGER
+    admin_log_channel_id INTEGER,
+    organize_mode        TEXT NOT NULL DEFAULT 'black',  -- 'black' | 'white'
+    organize_channels    TEXT NOT NULL DEFAULT '[]',     -- JSON 数组：黑名单/白名单频道 ID
+    risk_enabled         INTEGER NOT NULL DEFAULT 0,     -- 风控开关
+    risk_window_minutes  INTEGER NOT NULL DEFAULT 10,    -- 风控统计窗口（分钟）
+    risk_max_downloads   INTEGER NOT NULL DEFAULT 10,    -- 窗口内下载次数上限
+    risk_ban_hours       REAL NOT NULL DEFAULT 1,        -- 触发后封禁时长（小时）
+    ticket_channel_id    INTEGER                         -- 申诉工单发送频道
 );
+
+CREATE TABLE IF NOT EXISTS bans (
+    guild_id     INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    reason       TEXT NOT NULL DEFAULT '',
+    banned_until REAL NOT NULL,
+    created_at   REAL NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS download_events (
+    guild_id INTEGER NOT NULL,
+    user_id  INTEGER NOT NULL,
+    ts       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dl_events_user ON download_events (guild_id, user_id, ts);
+
+CREATE TABLE IF NOT EXISTS appeals (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'open',  -- 'open' | 'approved' | 'rejected'
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_appeals_user ON appeals (guild_id, user_id, status);
 """
 
 
@@ -81,6 +121,13 @@ class Database:
             "ALTER TABLE files ADD COLUMN password TEXT",
             "ALTER TABLE files ADD COLUMN trace_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE settings ADD COLUMN admin_log_channel_id INTEGER",
+            "ALTER TABLE settings ADD COLUMN organize_mode TEXT NOT NULL DEFAULT 'black'",
+            "ALTER TABLE settings ADD COLUMN organize_channels TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE settings ADD COLUMN risk_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE settings ADD COLUMN risk_window_minutes INTEGER NOT NULL DEFAULT 10",
+            "ALTER TABLE settings ADD COLUMN risk_max_downloads INTEGER NOT NULL DEFAULT 10",
+            "ALTER TABLE settings ADD COLUMN risk_ban_hours REAL NOT NULL DEFAULT 1",
+            "ALTER TABLE settings ADD COLUMN ticket_channel_id INTEGER",
         ):
             try:
                 await self._conn.execute(migration)
@@ -143,6 +190,172 @@ class Database:
                 (*fields.values(), guild_id),
             )
         await self.conn.commit()
+
+    async def get_organize_filter(self, guild_id: int) -> tuple[str, set[int]]:
+        """一键整理的频道黑白名单。返回 (模式, 频道 ID 集合)。
+
+        模式：black = 整理名单以外的所有频道（默认）；white = 只整理名单内的频道。
+        """
+        row = await self.get_settings(guild_id)
+        if row is None:
+            return "black", set()
+        keys = row.keys()
+        mode = row["organize_mode"] if "organize_mode" in keys else "black"
+        if mode not in ("black", "white"):
+            mode = "black"
+        raw = row["organize_channels"] if "organize_channels" in keys else "[]"
+        try:
+            ids = {int(x) for x in json.loads(raw or "[]")}
+        except (ValueError, TypeError):
+            ids = set()
+        return mode, ids
+
+    async def set_organize_filter(
+        self, guild_id: int, mode: str, channel_ids
+    ) -> None:
+        if mode not in ("black", "white"):
+            mode = "black"
+        await self.upsert_settings(
+            guild_id,
+            organize_mode=mode,
+            organize_channels=json.dumps([int(x) for x in channel_ids]),
+        )
+
+    # ────────────────────────── 风控（下载频率限制） ──────────────────────────
+
+    async def get_risk_config(self, guild_id: int) -> dict:
+        """风控配置：开关 / 统计窗口 / 次数上限 / 封禁时长。"""
+        row = await self.get_settings(guild_id)
+        cfg = {
+            "enabled": False,
+            "window_minutes": 10,
+            "max_downloads": 10,
+            "ban_hours": 1.0,
+        }
+        if row is None:
+            return cfg
+        keys = row.keys()
+        if "risk_enabled" in keys:
+            cfg["enabled"] = bool(row["risk_enabled"])
+        if "risk_window_minutes" in keys and row["risk_window_minutes"]:
+            cfg["window_minutes"] = int(row["risk_window_minutes"])
+        if "risk_max_downloads" in keys and row["risk_max_downloads"]:
+            cfg["max_downloads"] = int(row["risk_max_downloads"])
+        if "risk_ban_hours" in keys and row["risk_ban_hours"]:
+            cfg["ban_hours"] = float(row["risk_ban_hours"])
+        return cfg
+
+    async def set_risk_config(
+        self,
+        guild_id: int,
+        *,
+        enabled: bool | None = None,
+        window_minutes: int | None = None,
+        max_downloads: int | None = None,
+        ban_hours: float | None = None,
+    ) -> None:
+        fields: dict = {}
+        if enabled is not None:
+            fields["risk_enabled"] = 1 if enabled else 0
+        if window_minutes is not None:
+            fields["risk_window_minutes"] = max(1, int(window_minutes))
+        if max_downloads is not None:
+            fields["risk_max_downloads"] = max(1, int(max_downloads))
+        if ban_hours is not None:
+            fields["risk_ban_hours"] = max(0.05, float(ban_hours))
+        if fields:
+            await self.upsert_settings(guild_id, **fields)
+
+    async def record_download_event(self, guild_id: int, user_id: int) -> None:
+        """记录一次下载行为，并清理 24 小时前的流水。"""
+        now = time.time()
+        await self.conn.execute(
+            "INSERT INTO download_events (guild_id, user_id, ts) VALUES (?, ?, ?)",
+            (guild_id, user_id, now),
+        )
+        await self.conn.execute(
+            "DELETE FROM download_events WHERE ts < ?", (now - 86400,)
+        )
+        await self.conn.commit()
+
+    async def count_recent_downloads(
+        self, guild_id: int, user_id: int, window_minutes: int
+    ) -> int:
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) FROM download_events "
+            "WHERE guild_id = ? AND user_id = ? AND ts >= ?",
+            (guild_id, user_id, time.time() - window_minutes * 60),
+        )
+        (count,) = await cur.fetchone()
+        return int(count)
+
+    async def ban_user(
+        self, guild_id: int, user_id: int, hours: float, reason: str
+    ) -> float:
+        """封禁成员，返回解封时间戳。"""
+        until = time.time() + hours * 3600
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO bans (guild_id, user_id, reason, banned_until, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, reason, until, time.time()),
+        )
+        await self.conn.commit()
+        return until
+
+    async def get_active_ban(self, guild_id: int, user_id: int):
+        """返回生效中的封禁记录；过期则自动解除并返回 None。"""
+        cur = await self.conn.execute(
+            "SELECT * FROM bans WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        if row["banned_until"] <= time.time():
+            await self.unban_user(guild_id, user_id)
+            return None
+        return row
+
+    async def unban_user(self, guild_id: int, user_id: int) -> None:
+        await self.conn.execute(
+            "DELETE FROM bans WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        await self.conn.commit()
+
+    # ────────────────────────── 申诉工单 ──────────────────────────
+
+    async def create_appeal(
+        self, guild_id: int, user_id: int, channel_id: int, message_id: int
+    ) -> int:
+        cur = await self.conn.execute(
+            "INSERT INTO appeals (guild_id, user_id, channel_id, message_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (guild_id, user_id, channel_id, message_id, time.time()),
+        )
+        await self.conn.commit()
+        return cur.lastrowid
+
+    async def get_open_appeal(self, guild_id: int, user_id: int):
+        cur = await self.conn.execute(
+            "SELECT * FROM appeals WHERE guild_id = ? AND user_id = ? AND status = 'open' "
+            "ORDER BY id DESC LIMIT 1",
+            (guild_id, user_id),
+        )
+        return await cur.fetchone()
+
+    async def close_appeal(self, appeal_id: int, status: str) -> None:
+        await self.conn.execute(
+            "UPDATE appeals SET status = ? WHERE id = ?", (status, appeal_id)
+        )
+        await self.conn.commit()
+
+    async def list_open_appeals(self) -> list:
+        """全部未结案工单（启动时恢复投票按钮用）。"""
+        cur = await self.conn.execute(
+            "SELECT * FROM appeals WHERE status = 'open' ORDER BY id"
+        )
+        return await cur.fetchall()
 
     # ────────────────────────── files ──────────────────────────
 

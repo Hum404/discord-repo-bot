@@ -39,6 +39,8 @@ class RepoBot(commands.Bot):
         elif isinstance(error, app_commands.NoPrivateMessage):
             text = "❌ 该指令只能在服务器中使用。"
         elif isinstance(error, app_commands.CheckFailure):
+            if interaction.response.is_done():
+                return  # 检查函数已自行回复（如风控封禁提示）
             text = "❌ 你无法使用该指令。"
         else:
             log.exception(

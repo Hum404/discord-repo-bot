@@ -5,6 +5,7 @@ import asyncio
 import io
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import discord
@@ -15,6 +16,18 @@ from ..bot import RepoBot, fmt_size
 from ..tracing import inject_trace
 
 log = logging.getLogger("repo-bot")
+
+
+def fmt_duration(seconds: float) -> str:
+    """把秒数格式化为「X 小时 X 分钟」。"""
+    s = max(0, int(seconds))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h} 小时 {m} 分钟"
+    if m:
+        return f"{m} 分钟"
+    return f"{s} 秒"
 
 
 def build_storage_embed(
@@ -218,9 +231,252 @@ class DownloadPasswordModal(discord.ui.Modal, title="🔒 输入下载密码"):
         await self.cog._deliver_file(interaction, record)
 
 
+APPEAL_VOTES_REQUIRED = 2  # 解封/驳回各需的管理员票数
+
+
+class AppealVoteView(discord.ui.View):
+    """解封申诉工单：管理员投票，集齐 2 票同意即解封，2 票拒绝即驳回。
+
+    按钮使用固定 custom_id，配合 cog_load 中的 add_view 恢复，
+    Bot 重启后历史工单仍可继续投票（票数清零重新计）。
+    """
+
+    def __init__(
+        self,
+        bot: RepoBot,
+        guild_id: int,
+        user_id: int,
+        ban_reason: str,
+        banned_until: float,
+        appeal_reason: str,
+        appeal_id: int | None = None,
+    ):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.ban_reason = ban_reason
+        self.banned_until = banned_until
+        self.appeal_reason = appeal_reason
+        self.appeal_id = appeal_id
+        self.yes_voters: set[int] = set()
+        self.no_voters: set[int] = set()
+        self.message: discord.Message | None = None
+
+    def initial_embed(self, member: discord.Member | discord.User) -> discord.Embed:
+        embed = discord.Embed(
+            title="🎫 解封申诉工单",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="申请人", value=f"{member.mention} (`{member.id}`)", inline=False
+        )
+        embed.add_field(name="封禁原因", value=self.ban_reason or "（未知）", inline=False)
+        embed.add_field(
+            name="原定解封", value=f"<t:{int(self.banned_until)}:R>", inline=True
+        )
+        embed.add_field(
+            name="申诉理由", value=self.appeal_reason or "（未填写）", inline=False
+        )
+        embed.add_field(name="投票进度", value=self._progress_text(), inline=False)
+        return embed
+
+    def _progress_text(self) -> str:
+        return (
+            f"✅ 同意解封 {len(self.yes_voters)}/{APPEAL_VOTES_REQUIRED}　"
+            f"❌ 拒绝 {len(self.no_voters)}/{APPEAL_VOTES_REQUIRED}"
+        )
+
+    def _update_embed(
+        self, message: discord.Message, result: str | None = None
+    ) -> discord.Embed:
+        """在原工单嵌入上更新投票进度（重启后恢复的视图也能正确更新）。"""
+        if message.embeds:
+            embed = message.embeds[0]
+        else:
+            embed = discord.Embed(title="🎫 解封申诉工单", color=discord.Color.orange())
+        for i, field in enumerate(embed.fields):
+            if field.name == "投票进度":
+                embed.set_field_at(
+                    i, name="投票进度", value=self._progress_text(), inline=False
+                )
+                break
+        else:
+            embed.add_field(name="投票进度", value=self._progress_text(), inline=False)
+        if result is not None:
+            embed.add_field(name="处理结果", value=result, inline=False)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        user = interaction.user
+        if isinstance(user, discord.Member) and user.guild_permissions.administrator:
+            return True
+        await interaction.response.send_message(
+            "❌ 只有管理员可以处理工单。", ephemeral=True
+        )
+        return False
+
+    def _disable(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def _vote(self, interaction: discord.Interaction, approve: bool) -> None:
+        uid = interaction.user.id
+        if uid in self.yes_voters or uid in self.no_voters:
+            await interaction.response.send_message("你已经投过票了。", ephemeral=True)
+            return
+        (self.yes_voters if approve else self.no_voters).add(uid)
+        if len(self.yes_voters) >= APPEAL_VOTES_REQUIRED:
+            await self._finish(interaction, approved=True)
+        elif len(self.no_voters) >= APPEAL_VOTES_REQUIRED:
+            await self._finish(interaction, approved=False)
+        else:
+            await interaction.response.edit_message(
+                embed=self._update_embed(interaction.message), view=self
+            )
+
+    async def _finish(self, interaction: discord.Interaction, *, approved: bool) -> None:
+        self._disable()
+        result_text = (
+            f"✅ 申诉通过，已解除限制（{interaction.user.mention} 等 "
+            f"{APPEAL_VOTES_REQUIRED} 名管理员同意）"
+            if approved
+            else f"❌ 申诉驳回，封禁继续生效（{interaction.user.mention} 等 "
+            f"{APPEAL_VOTES_REQUIRED} 名管理员拒绝）"
+        )
+        embed = self._update_embed(interaction.message, result=result_text)
+        embed.color = discord.Color.green() if approved else discord.Color.red()
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+        if approved:
+            await self.bot.db.unban_user(self.guild_id, self.user_id)
+        if self.appeal_id is not None:
+            await self.bot.db.close_appeal(
+                self.appeal_id, "approved" if approved else "rejected"
+            )
+        else:  # 兼容路径：按用户关闭未结案工单
+            await self.bot.db.conn.execute(
+                "UPDATE appeals SET status = ? "
+                "WHERE guild_id = ? AND user_id = ? AND status = 'open'",
+                ("approved" if approved else "rejected", self.guild_id, self.user_id),
+            )
+            await self.bot.db.conn.commit()
+
+        try:
+            user = await self.bot.fetch_user(self.user_id)
+            await user.send(
+                "✅ 你的解封申诉已通过，限制已解除。"
+                if approved
+                else "❌ 你的解封申诉被驳回，封禁继续生效，到期自动解除。"
+            )
+        except discord.HTTPException:
+            pass
+        guild = self.bot.get_guild(self.guild_id)
+        if guild is not None:
+            await self.bot.log_admin(
+                guild,
+                interaction.user,
+                f"🎫 申诉工单{'已通过（已解封）' if approved else '已驳回'}：<@{self.user_id}>",
+            )
+
+    @discord.ui.button(
+        label="同意解封", emoji="✅",
+        style=discord.ButtonStyle.success, custom_id="appeal:yes",
+    )
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._vote(interaction, approve=True)
+
+    @discord.ui.button(
+        label="拒绝", emoji="❌",
+        style=discord.ButtonStyle.danger, custom_id="appeal:no",
+    )
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._vote(interaction, approve=False)
+
+
 class FilesCog(commands.Cog, name="文件"):
     def __init__(self, bot: RepoBot):
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        """恢复未结案申诉工单的投票按钮（重启后仍可投票）。"""
+        try:
+            rows = await self.bot.db.list_open_appeals()
+        except Exception:
+            log.exception("读取未结案申诉工单失败")
+            return
+        for row in rows:
+            view = AppealVoteView(
+                self.bot, row["guild_id"], row["user_id"],
+                ban_reason="", banned_until=row["created_at"], appeal_reason="",
+                appeal_id=row["id"],
+            )
+            self.bot.add_view(view, message_id=row["message_id"])
+        if rows:
+            log.info("已恢复 %d 个未结案申诉工单的投票按钮", len(rows))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """风控封禁拦截：被封禁成员无法使用本 cog 的任何指令（/appeal 除外）。"""
+        ban = await self._check_ban(interaction)
+        if ban is None:
+            return True
+        remaining = fmt_duration(ban["banned_until"] - time.time())
+        try:
+            await interaction.response.send_message(
+                f"⛔ 你已被风控限制，**{remaining}**后解除。\n"
+                f"原因：{ban['reason']}\n"
+                "如有异议可使用 `/appeal` 提交申诉工单。",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
+        return False
+
+    async def _check_ban(self, interaction: discord.Interaction):
+        """返回生效中的封禁记录；管理员与 /appeal 指令不受限。"""
+        if interaction.guild is None:
+            return None
+        user = interaction.user
+        if isinstance(user, discord.Member) and user.guild_permissions.administrator:
+            return None
+        if interaction.command is not None and interaction.command.name == "appeal":
+            return None
+        return await self.bot.db.get_active_ban(interaction.guild.id, user.id)
+
+    async def _risk_track(self, interaction: discord.Interaction) -> None:
+        """记录一次下载行为；超过风控阈值则自动封禁并通知。"""
+        guild = interaction.guild
+        if guild is None:
+            return
+        user = interaction.user
+        if isinstance(user, discord.Member) and user.guild_permissions.administrator:
+            return
+        cfg = await self.bot.db.get_risk_config(guild.id)
+        if not cfg["enabled"]:
+            return
+        await self.bot.db.record_download_event(guild.id, user.id)
+        count = await self.bot.db.count_recent_downloads(
+            guild.id, user.id, cfg["window_minutes"]
+        )
+        if count <= cfg["max_downloads"]:
+            return
+        reason = f"{cfg['window_minutes']} 分钟内下载 {count} 次，过于频繁"
+        until = await self.bot.db.ban_user(guild.id, user.id, cfg["ban_hours"], reason)
+        duration = fmt_duration(cfg["ban_hours"] * 3600)
+        try:
+            await interaction.followup.send(
+                f"⛔ 检测到异常下载行为：{reason}。\n"
+                f"你已被风控限制，**{duration}**内无法使用 Bot"
+                f"（<t:{int(until)}:R> 解除）。如有异议可使用 `/appeal` 申诉。",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
+        await self.bot.log_admin(
+            guild, user, f"⛔ 触发风控：{reason} → 封禁 {duration}"
+        )
 
     async def _resolve_file(self, guild_id: int, ref: str):
         """支持文件编号（#3 或 3）或完整文件 ID。"""
@@ -416,6 +672,13 @@ class FilesCog(commands.Cog, name="文件"):
     async def _deliver_file(self, interaction: discord.Interaction, record) -> None:
         """从存储频道取回文件并发送，落库下载记录。调用前必须已 defer。"""
         assert interaction.guild is not None
+        # 风控：密码弹窗路径不经过指令检查，这里再拦一次
+        ban = await self._check_ban(interaction)
+        if ban is not None:
+            await interaction.followup.send(
+                "⛔ 你已被风控限制，暂时无法使用 Bot。", ephemeral=True
+            )
+            return
         storage_channel = self.bot.get_channel(record["storage_channel_id"])
         if not isinstance(storage_channel, discord.TextChannel):
             await interaction.followup.send(
@@ -502,6 +765,8 @@ class FilesCog(commands.Cog, name="文件"):
                 file=discord.File(io.BytesIO(data), filename=record["name"]),
                 ephemeral=True,
             )
+            # 风控：统计下载频率，触发阈值则自动封禁
+            await self._risk_track(interaction)
         except discord.HTTPException:
             await interaction.followup.send(
                 "❌ 发送文件失败（可能超出大小限制）。", ephemeral=True
@@ -649,6 +914,79 @@ class FilesCog(commands.Cog, name="文件"):
                 )
             embed.description = "\n".join(lines)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ────────────────────────── 风控申诉 ──────────────────────────
+
+    @app_commands.command(
+        name="appeal", description="风控申诉：提交解封工单，由管理员投票处理"
+    )
+    @app_commands.describe(reason="申诉理由（可选）")
+    async def appeal(self, interaction: discord.Interaction, reason: str | None = None):
+        assert interaction.guild is not None
+        ban = await self.bot.db.get_active_ban(
+            interaction.guild.id, interaction.user.id
+        )
+        if ban is None:
+            await interaction.response.send_message(
+                "✅ 你当前没有被风控限制。", ephemeral=True
+            )
+            return
+        existing = await self.bot.db.get_open_appeal(
+            interaction.guild.id, interaction.user.id
+        )
+        if existing is not None:
+            await interaction.response.send_message(
+                "⏳ 你已有待处理的申诉工单，请耐心等待管理员投票。", ephemeral=True
+            )
+            return
+        settings = await self.bot.db.get_settings(interaction.guild.id)
+        channel_id = (
+            settings["ticket_channel_id"]
+            if settings is not None and "ticket_channel_id" in settings.keys()
+            else None
+        )
+        channel = interaction.guild.get_channel(channel_id) if channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ 管理员尚未设置工单频道（`/ticket_channel`），请联系管理员处理。",
+                ephemeral=True,
+            )
+            return
+
+        # @所有管理员角色（找不到则退回 @here）
+        admin_roles = [
+            r
+            for r in interaction.guild.roles
+            if r.permissions.administrator and not r.managed and not r.is_default()
+        ]
+        mention = " ".join(r.mention for r in admin_roles[:10]) or "@here"
+
+        view = AppealVoteView(
+            self.bot,
+            interaction.guild.id,
+            interaction.user.id,
+            ban["reason"],
+            ban["banned_until"],
+            (reason or "").strip(),
+        )
+        try:
+            msg = await channel.send(
+                content=mention, embed=view.initial_embed(interaction.user), view=view
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ Bot 无权在 {channel.mention} 发送消息，请联系管理员检查权限。",
+                ephemeral=True,
+            )
+            return
+        view.message = msg
+        view.appeal_id = await self.bot.db.create_appeal(
+            interaction.guild.id, interaction.user.id, channel.id, msg.id
+        )
+        await interaction.response.send_message(
+            f"✅ 申诉工单已提交到 {channel.mention}，请等待管理员投票处理。",
+            ephemeral=True,
+        )
 
     # ────────────────────────── 删除 ──────────────────────────
 
