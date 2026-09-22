@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from ..bot import RepoBot, fmt_size
 from ..tracing import inject_trace
@@ -396,6 +396,135 @@ class AppealVoteView(discord.ui.View):
         await self._vote(interaction, approve=False)
 
 
+class RiskReviewView(discord.ui.View):
+    """风控异常待处理工单：管理员可「立即封禁」或「放行」。
+
+    超时未处理由 FilesCog 的后台扫描自动封禁。按钮使用固定 custom_id，
+    配合 cog_load 中的 add_view 恢复，Bot 重启后历史工单仍可处理。
+    """
+
+    def __init__(
+        self,
+        bot: RepoBot,
+        review_id: int,
+        guild_id: int,
+        user_id: int,
+        reason: str,
+        ban_hours: float,
+        deadline: float,
+    ):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.review_id = review_id
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.reason = reason
+        self.ban_hours = ban_hours
+        self.deadline = deadline
+        self.message: discord.Message | None = None
+
+    def initial_embed(self, user: discord.User | discord.Member) -> discord.Embed:
+        embed = discord.Embed(
+            title="🚨 风控异常待处理",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="触发成员", value=f"{user.mention} (`{user.id}`)", inline=False
+        )
+        embed.add_field(name="异常行为", value=self.reason or "（未知）", inline=False)
+        embed.add_field(
+            name="处理时限",
+            value=(
+                f"<t:{int(self.deadline)}:R> 仍未处理将自动封禁 "
+                f"**{fmt_duration(self.ban_hours * 3600)}**"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="点击「立即封禁」或「放行」进行处理")
+        return embed
+
+    def _result_embed(
+        self, message: discord.Message, result: str, color: discord.Color
+    ) -> discord.Embed:
+        """在原通知嵌入上追加处理结果（重启后恢复的视图也能正确更新）。"""
+        if message.embeds:
+            embed = message.embeds[0]
+        else:
+            embed = discord.Embed(title="🚨 风控异常待处理")
+        embed.color = color
+        embed.add_field(name="处理结果", value=result, inline=False)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator:
+            return True
+        await interaction.response.send_message(
+            "❌ 只有管理员可以处理工单。", ephemeral=True
+        )
+        return False
+
+    def _disable(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(
+        label="立即封禁", emoji="⛔",
+        style=discord.ButtonStyle.danger, custom_id="risk_review:ban",
+    )
+    async def ban_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, action="ban")
+
+    @discord.ui.button(
+        label="放行", emoji="✅",
+        style=discord.ButtonStyle.secondary, custom_id="risk_review:dismiss",
+    )
+    async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, action="dismiss")
+
+    async def _resolve(self, interaction: discord.Interaction, *, action: str) -> None:
+        assert interaction.guild is not None
+        # 条件更新占位，防止与后台超时扫描并发重复处置
+        status = "banned" if action == "ban" else "dismissed"
+        if not await self.bot.db.close_risk_review(self.review_id, status):
+            await interaction.response.send_message(
+                "⚠️ 该工单已被处理（可能已超时自动封禁）。", ephemeral=True
+            )
+            return
+        dm_text = None
+        if action == "ban":
+            until = await self.bot.db.ban_user(
+                self.guild_id, self.user_id, self.ban_hours, self.reason
+            )
+            duration = fmt_duration(self.ban_hours * 3600)
+            result = (
+                f"⛔ 已由 {interaction.user.mention} 手动封禁 **{duration}**"
+                f"（<t:{int(until)}:R> 解除）"
+            )
+            color = discord.Color.red()
+            dm_text = (
+                f"⛔ 你因异常下载行为（{self.reason}）已被管理员封禁 {duration}。"
+                "如有异议可到服务器内使用 `/appeal` 申诉。"
+            )
+            log_text = f"⛔ 处理风控工单：手动封禁 <@{self.user_id}> {duration}"
+        else:
+            result = f"✅ 已由 {interaction.user.mention} 放行，不予处理"
+            color = discord.Color.green()
+            log_text = f"✅ 处理风控工单：放行 <@{self.user_id}>"
+        self._disable()
+        await interaction.response.edit_message(
+            embed=self._result_embed(interaction.message, result, color), view=self
+        )
+        self.stop()
+        if dm_text is not None:
+            try:
+                user = await self.bot.fetch_user(self.user_id)
+                await user.send(dm_text)
+            except discord.HTTPException:
+                pass
+        await self.bot.log_admin(interaction.guild, interaction.user, log_text)
+
+
 class FilesCog(commands.Cog, name="文件"):
     def __init__(self, bot: RepoBot):
         self.bot = bot
@@ -416,6 +545,94 @@ class FilesCog(commands.Cog, name="文件"):
             self.bot.add_view(view, message_id=row["message_id"])
         if rows:
             log.info("已恢复 %d 个未结案申诉工单的投票按钮", len(rows))
+        # 恢复待处理风控工单的处理按钮，并启动超时自动封禁扫描
+        try:
+            pending = await self.bot.db.list_pending_risk_reviews()
+        except Exception:
+            log.exception("读取待处理风控工单失败")
+            pending = []
+        for row in pending:
+            if row["message_id"]:
+                view = RiskReviewView(
+                    self.bot, row["id"], row["guild_id"], row["user_id"],
+                    row["reason"], row["ban_hours"], row["deadline"],
+                )
+                self.bot.add_view(view, message_id=row["message_id"])
+        if pending:
+            log.info("已恢复 %d 个待处理风控工单的处理按钮", len(pending))
+        self._review_sweeper.start()
+
+    async def cog_unload(self) -> None:
+        self._review_sweeper.cancel()
+
+    # ───────────────────── 风控工单超时扫描 ─────────────────────
+
+    @tasks.loop(seconds=30)
+    async def _review_sweeper(self) -> None:
+        """每 30 秒扫描一次：超过处理时限仍未处理的工单自动封禁。"""
+        try:
+            expired = await self.bot.db.list_expired_risk_reviews(time.time())
+        except Exception:
+            log.exception("扫描到期风控工单失败")
+            return
+        for row in expired:
+            await self._auto_ban_expired_review(row)
+
+    @_review_sweeper.before_loop
+    async def _before_review_sweeper(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _auto_ban_expired_review(self, row) -> None:
+        """工单超时未处理：自动封禁并更新通知消息。"""
+        # 条件更新占位，防止与管理员点击按钮并发重复处置
+        if not await self.bot.db.close_risk_review(row["id"], "auto_banned"):
+            return
+        until = await self.bot.db.ban_user(
+            row["guild_id"], row["user_id"], row["ban_hours"], row["reason"]
+        )
+        duration = fmt_duration(row["ban_hours"] * 3600)
+        log.info(
+            "风控工单超时自动封禁：guild=%s user=%s hours=%s",
+            row["guild_id"], row["user_id"], row["ban_hours"],
+        )
+        # 编辑通知消息：标记已自动封禁并移除按钮
+        channel = (
+            self.bot.get_channel(row["channel_id"]) if row["channel_id"] else None
+        )
+        if isinstance(channel, discord.TextChannel) and row["message_id"]:
+            try:
+                msg = await channel.fetch_message(row["message_id"])
+                embed = (
+                    msg.embeds[0]
+                    if msg.embeds
+                    else discord.Embed(title="🚨 风控异常待处理")
+                )
+                embed.color = discord.Color.red()
+                embed.add_field(
+                    name="处理结果",
+                    value=(
+                        f"⏰ 超过处理时限，已自动封禁 **{duration}**"
+                        f"（<t:{int(until)}:R> 解除）"
+                    ),
+                    inline=False,
+                )
+                await msg.edit(embed=embed, view=None)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        try:
+            user = await self.bot.fetch_user(row["user_id"])
+            await user.send(
+                f"⛔ 你因异常下载行为（{row['reason']}）已被自动封禁 {duration}"
+                "（管理员超时未处理）。如有异议可到服务器内使用 `/appeal` 申诉。"
+            )
+        except discord.HTTPException:
+            pass
+        guild = self.bot.get_guild(row["guild_id"])
+        if guild is not None and self.bot.user is not None:
+            await self.bot.log_admin(
+                guild, self.bot.user,
+                f"⏰ 风控工单超时未处理，已自动封禁 <@{row['user_id']}> {duration}",
+            )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """风控封禁拦截：被封禁成员无法使用本 cog 的任何指令（/appeal 除外）。"""
@@ -446,7 +663,7 @@ class FilesCog(commands.Cog, name="文件"):
         return await self.bot.db.get_active_ban(interaction.guild.id, user.id)
 
     async def _risk_track(self, interaction: discord.Interaction) -> None:
-        """记录一次下载行为；超过风控阈值则自动封禁并通知。"""
+        """记录一次下载行为；超过风控阈值则按配置处置（自动封禁 / 通知管理员）。"""
         guild = interaction.guild
         if guild is None:
             return
@@ -463,8 +680,20 @@ class FilesCog(commands.Cog, name="文件"):
         if count <= cfg["max_downloads"]:
             return
         reason = f"{cfg['window_minutes']} 分钟内下载 {count} 次，过于频繁"
-        until = await self.bot.db.ban_user(guild.id, user.id, cfg["ban_hours"], reason)
-        duration = fmt_duration(cfg["ban_hours"] * 3600)
+        if cfg["action_mode"] == "review":
+            # 通知管理员处理；超时未处理由后台扫描自动封禁
+            await self._escalate_review(interaction, cfg, reason)
+            return
+        await self._auto_ban(interaction, cfg["ban_hours"], reason)
+
+    async def _auto_ban(
+        self, interaction: discord.Interaction, hours: float, reason: str
+    ) -> None:
+        """立即封禁触发风控的成员并通知（自动封禁模式）。"""
+        guild = interaction.guild
+        user = interaction.user
+        until = await self.bot.db.ban_user(guild.id, user.id, hours, reason)
+        duration = fmt_duration(hours * 3600)
         try:
             await interaction.followup.send(
                 f"⛔ 检测到异常下载行为：{reason}。\n"
@@ -476,6 +705,88 @@ class FilesCog(commands.Cog, name="文件"):
             pass
         await self.bot.log_admin(
             guild, user, f"⛔ 触发风控：{reason} → 封禁 {duration}"
+        )
+
+    async def _review_notify_channel(
+        self, guild: discord.Guild
+    ) -> discord.TextChannel | None:
+        """异常工单通知频道：优先工单频道，其次管理日志频道，最后审计日志频道。"""
+        settings = await self.bot.db.get_settings(guild.id)
+        if settings is None:
+            return None
+        keys = settings.keys()
+        for key in ("ticket_channel_id", "admin_log_channel_id", "log_channel_id"):
+            cid = settings[key] if key in keys else None
+            if cid:
+                channel = guild.get_channel(cid)
+                if isinstance(channel, discord.TextChannel):
+                    return channel
+        return None
+
+    async def _escalate_review(
+        self, interaction: discord.Interaction, cfg: dict, reason: str
+    ) -> None:
+        """通知管理员模式：生成待处理工单，超时未处理自动封禁。"""
+        guild = interaction.guild
+        user = interaction.user
+        # 已有待处理工单：不重复通知管理员
+        if await self.bot.db.get_pending_risk_review(guild.id, user.id) is not None:
+            return
+        deadline = time.time() + cfg["review_minutes"] * 60
+        review_id = await self.bot.db.create_risk_review(
+            guild.id, user.id, reason, cfg["ban_hours"], deadline
+        )
+
+        async def _fallback_auto_ban(note: str) -> None:
+            """无法通知管理员时退化为立即自动封禁，避免异常行为无人处置。"""
+            await self.bot.db.close_risk_review(review_id, "auto_banned")
+            await self._auto_ban(interaction, cfg["ban_hours"], reason)
+            await self.bot.log_admin(guild, user, note)
+
+        channel = await self._review_notify_channel(guild)
+        if channel is None:
+            await _fallback_auto_ban(
+                "⚠️ 触发风控但未配置工单/日志频道，已按自动封禁处理"
+            )
+            return
+
+        # @所有管理员角色（找不到则退回 @here）
+        admin_roles = [
+            r
+            for r in guild.roles
+            if r.permissions.administrator and not r.managed and not r.is_default()
+        ]
+        mention = " ".join(r.mention for r in admin_roles[:10]) or "@here"
+
+        view = RiskReviewView(
+            self.bot, review_id, guild.id, user.id,
+            reason, cfg["ban_hours"], deadline,
+        )
+        try:
+            msg = await channel.send(
+                content=mention, embed=view.initial_embed(user), view=view
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await _fallback_auto_ban(
+                f"⚠️ 触发风控但无法在 {channel.mention} 发送工单，已按自动封禁处理"
+            )
+            return
+        view.message = msg
+        await self.bot.db.set_risk_review_message(review_id, channel.id, msg.id)
+
+        try:
+            await interaction.followup.send(
+                f"⚠️ 检测到异常下载行为：{reason}。\n"
+                f"已通知管理员处理；若 **{cfg['review_minutes']}** 分钟内未处理，"
+                f"将自动封禁 {fmt_duration(cfg['ban_hours'] * 3600)}。",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
+        await self.bot.log_admin(
+            guild, user,
+            f"🚨 触发风控（通知模式）：{reason} → 已发待处理工单至 #{channel.name}，"
+            f"{cfg['review_minutes']} 分钟内未处理将自动封禁",
         )
 
     async def _resolve_file(self, guild_id: int, ref: str):

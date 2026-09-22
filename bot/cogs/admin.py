@@ -395,7 +395,7 @@ class OrganizeConfirmView(discord.ui.View):
 
 
 class RiskConfigModal(discord.ui.Modal, title="🛡️ 风控参数设置"):
-    """风控参数弹窗：统计窗口 / 次数上限 / 封禁时长。"""
+    """风控参数弹窗：统计窗口 / 次数上限 / 封禁时长 / 管理员处理时限。"""
 
     def __init__(self, view: "RiskConfigView"):
         super().__init__()
@@ -413,26 +413,34 @@ class RiskConfigModal(discord.ui.Modal, title="🛡️ 风控参数设置"):
             label="封禁时长（小时，可填 0.5）", default=f"{cfg['ban_hours']:g}",
             min_length=1, max_length=6,
         )
+        self.review_minutes = discord.ui.TextInput(
+            label="管理员处理时限（分钟，仅通知模式）",
+            default=str(cfg["review_minutes"]),
+            min_length=1, max_length=5,
+        )
         self.add_item(self.window)
         self.add_item(self.max_dl)
         self.add_item(self.hours)
+        self.add_item(self.review_minutes)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
             window = int(self.window.value)
             max_dl = int(self.max_dl.value)
             hours = float(self.hours.value)
-            if window < 1 or max_dl < 1 or hours <= 0:
+            review_minutes = int(self.review_minutes.value)
+            if window < 1 or max_dl < 1 or hours <= 0 or review_minutes < 1:
                 raise ValueError
         except ValueError:
             await interaction.response.send_message(
-                "❌ 参数格式不正确：窗口与次数需为正整数，封禁时长为正数。",
+                "❌ 参数格式不正确：窗口、次数与处理时限需为正整数，封禁时长为正数。",
                 ephemeral=True,
             )
             return
         await self.view.cog.bot.db.set_risk_config(
             interaction.guild.id,
             window_minutes=window, max_downloads=max_dl, ban_hours=hours,
+            review_minutes=review_minutes,
         )
         self.view.cfg = await self.view.cog.bot.db.get_risk_config(interaction.guild.id)
         await interaction.response.edit_message(
@@ -440,7 +448,8 @@ class RiskConfigModal(discord.ui.Modal, title="🛡️ 风控参数设置"):
         )
         await self.view.cog.bot.log_admin(
             interaction.guild, interaction.user,
-            f"🛡️ 修改风控参数：{window} 分钟内最多 {max_dl} 次下载，触发封禁 {hours:g} 小时",
+            f"🛡️ 修改风控参数：{window} 分钟内最多 {max_dl} 次下载，触发封禁 {hours:g} 小时，"
+            f"通知模式下管理员处理时限 {review_minutes} 分钟",
         )
 
 
@@ -464,19 +473,48 @@ class RiskConfigView(discord.ui.View):
                     default=not cfg["enabled"],
                 ),
             ],
+            row=0,
         )
         toggle.callback = self._on_toggle
         self.add_item(toggle)
 
+        mode = discord.ui.Select(
+            options=[
+                discord.SelectOption(
+                    label="触发后自动封禁", value="auto", emoji="⛔",
+                    description="检测到异常立即封禁",
+                    default=cfg["action_mode"] == "auto",
+                ),
+                discord.SelectOption(
+                    label="触发后通知管理员处理", value="review", emoji="🚨",
+                    description="发工单给管理员，超时未处理自动封禁",
+                    default=cfg["action_mode"] == "review",
+                ),
+            ],
+            row=1,
+        )
+        mode.callback = self._on_mode
+        self.add_item(mode)
+
     def make_embed(self) -> discord.Embed:
         cfg = self.cfg
         status = "✅ 已启用" if cfg["enabled"] else "❌ 已关闭"
+        if cfg["action_mode"] == "review":
+            action_text = (
+                "🚨 **通知管理员处理**：发送待处理工单（工单频道优先，未设置则\n"
+                "退回管理/审计日志频道），管理员可「立即封禁」或「放行」；\n"
+                f"若 **{cfg['review_minutes']}** 分钟内未处理 → 自动封禁 "
+                f"**{cfg['ban_hours']:g}** 小时"
+            )
+        else:
+            action_text = f"⛔ **自动封禁**：立即封禁 **{cfg['ban_hours']:g}** 小时"
         return discord.Embed(
             title="🛡️ 下载风控配置",
             description=(
                 f"状态：**{status}**\n\n"
                 f"成员在 **{cfg['window_minutes']}** 分钟内下载超过 "
-                f"**{cfg['max_downloads']}** 次 → 封禁 **{cfg['ban_hours']:g}** 小时\n\n"
+                f"**{cfg['max_downloads']}** 次即触发风控\n\n"
+                f"触发后处置：{action_text}\n\n"
                 "被封禁成员无法使用 Bot 任何指令（`/appeal` 申诉除外），到期自动解封。\n"
                 "被风控成员可提交申诉工单，由管理员投票解封（`/ticket_channel` 设置工单频道）。\n"
                 "管理员不受风控限制。"
@@ -494,7 +532,18 @@ class RiskConfigView(discord.ui.View):
             f"🛡️ {'启用' if enabled else '关闭'}下载风控",
         )
 
-    @discord.ui.button(label="修改参数", emoji="✏️", style=discord.ButtonStyle.primary, row=1)
+    async def _on_mode(self, interaction: discord.Interaction) -> None:
+        mode = interaction.data["values"][0]
+        await self.cog.bot.db.set_risk_config(interaction.guild.id, action_mode=mode)
+        self.cfg = await self.cog.bot.db.get_risk_config(interaction.guild.id)
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+        await self.cog.bot.log_admin(
+            interaction.guild, interaction.user,
+            f"🛡️ 风控处置方式 → "
+            f"{'自动封禁' if mode == 'auto' else '通知管理员处理（超时未处理自动封禁）'}",
+        )
+
+    @discord.ui.button(label="修改参数", emoji="✏️", style=discord.ButtonStyle.primary, row=2)
     async def edit_params(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RiskConfigModal(self))
 
@@ -1037,7 +1086,7 @@ class AdminCog(commands.Cog, name="管理"):
 
     @app_commands.command(
         name="risk_config",
-        description="配置下载风控：时间窗口内下载次数上限与封禁时长（管理员）",
+        description="配置下载风控：频率上限、处置方式（自动封禁/通知管理员）与封禁时长（管理员）",
     )
     @admin_only
     async def risk_config(self, interaction: discord.Interaction):

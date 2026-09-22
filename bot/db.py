@@ -9,6 +9,7 @@
 - bans            : 风控封禁（到期自动解除）
 - download_events : 近期下载行为流水（用于频率判定）
 - appeals         : 解封申诉工单
+- risk_reviews    : 异常待处理工单（通知管理员模式，超时未处理自动封禁）
 """
 from __future__ import annotations
 
@@ -65,6 +66,8 @@ CREATE TABLE IF NOT EXISTS settings (
     risk_window_minutes  INTEGER NOT NULL DEFAULT 10,    -- 风控统计窗口（分钟）
     risk_max_downloads   INTEGER NOT NULL DEFAULT 10,    -- 窗口内下载次数上限
     risk_ban_hours       REAL NOT NULL DEFAULT 1,        -- 触发后封禁时长（小时）
+    risk_action_mode     TEXT NOT NULL DEFAULT 'auto',   -- 触发处置：'auto' 自动封禁 | 'review' 通知管理员
+    risk_review_minutes  INTEGER NOT NULL DEFAULT 30,    -- 通知模式下管理员处理时限（分钟），超时自动封禁
     ticket_channel_id    INTEGER                         -- 申诉工单发送频道
 );
 
@@ -94,6 +97,20 @@ CREATE TABLE IF NOT EXISTS appeals (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_appeals_user ON appeals (guild_id, user_id, status);
+
+CREATE TABLE IF NOT EXISTS risk_reviews (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    ban_hours  REAL NOT NULL DEFAULT 1,                -- 封禁时采用的时长（创建时快照）
+    deadline   REAL NOT NULL,                          -- 管理员处理时限（到期自动封禁）
+    status     TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'banned' | 'dismissed' | 'auto_banned'
+    channel_id INTEGER,
+    message_id INTEGER,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_risk_reviews_pending ON risk_reviews (status, deadline);
 """
 
 
@@ -127,6 +144,8 @@ class Database:
             "ALTER TABLE settings ADD COLUMN risk_window_minutes INTEGER NOT NULL DEFAULT 10",
             "ALTER TABLE settings ADD COLUMN risk_max_downloads INTEGER NOT NULL DEFAULT 10",
             "ALTER TABLE settings ADD COLUMN risk_ban_hours REAL NOT NULL DEFAULT 1",
+            "ALTER TABLE settings ADD COLUMN risk_action_mode TEXT NOT NULL DEFAULT 'auto'",
+            "ALTER TABLE settings ADD COLUMN risk_review_minutes INTEGER NOT NULL DEFAULT 30",
             "ALTER TABLE settings ADD COLUMN ticket_channel_id INTEGER",
         ):
             try:
@@ -231,6 +250,8 @@ class Database:
             "window_minutes": 10,
             "max_downloads": 10,
             "ban_hours": 1.0,
+            "action_mode": "auto",  # 'auto' 立即封禁 | 'review' 通知管理员，超时自动封禁
+            "review_minutes": 30,
         }
         if row is None:
             return cfg
@@ -243,6 +264,10 @@ class Database:
             cfg["max_downloads"] = int(row["risk_max_downloads"])
         if "risk_ban_hours" in keys and row["risk_ban_hours"]:
             cfg["ban_hours"] = float(row["risk_ban_hours"])
+        if "risk_action_mode" in keys and row["risk_action_mode"] in ("auto", "review"):
+            cfg["action_mode"] = row["risk_action_mode"]
+        if "risk_review_minutes" in keys and row["risk_review_minutes"]:
+            cfg["review_minutes"] = int(row["risk_review_minutes"])
         return cfg
 
     async def set_risk_config(
@@ -253,6 +278,8 @@ class Database:
         window_minutes: int | None = None,
         max_downloads: int | None = None,
         ban_hours: float | None = None,
+        action_mode: str | None = None,
+        review_minutes: int | None = None,
     ) -> None:
         fields: dict = {}
         if enabled is not None:
@@ -263,6 +290,10 @@ class Database:
             fields["risk_max_downloads"] = max(1, int(max_downloads))
         if ban_hours is not None:
             fields["risk_ban_hours"] = max(0.05, float(ban_hours))
+        if action_mode in ("auto", "review"):
+            fields["risk_action_mode"] = action_mode
+        if review_minutes is not None:
+            fields["risk_review_minutes"] = max(1, int(review_minutes))
         if fields:
             await self.upsert_settings(guild_id, **fields)
 
@@ -354,6 +385,70 @@ class Database:
         """全部未结案工单（启动时恢复投票按钮用）。"""
         cur = await self.conn.execute(
             "SELECT * FROM appeals WHERE status = 'open' ORDER BY id"
+        )
+        return await cur.fetchall()
+
+    # ────────────────────────── 风控待处理工单 ──────────────────────────
+
+    async def create_risk_review(
+        self,
+        guild_id: int,
+        user_id: int,
+        reason: str,
+        ban_hours: float,
+        deadline: float,
+    ) -> int:
+        """创建一条异常待处理工单，返回工单 ID。"""
+        cur = await self.conn.execute(
+            "INSERT INTO risk_reviews (guild_id, user_id, reason, ban_hours, deadline, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, reason, ban_hours, deadline, time.time()),
+        )
+        await self.conn.commit()
+        return cur.lastrowid
+
+    async def set_risk_review_message(
+        self, review_id: int, channel_id: int, message_id: int
+    ) -> None:
+        """回写工单通知消息定位（重启后恢复按钮、超时后编辑消息用）。"""
+        await self.conn.execute(
+            "UPDATE risk_reviews SET channel_id = ?, message_id = ? WHERE id = ?",
+            (channel_id, message_id, review_id),
+        )
+        await self.conn.commit()
+
+    async def get_pending_risk_review(self, guild_id: int, user_id: int):
+        cur = await self.conn.execute(
+            "SELECT * FROM risk_reviews WHERE guild_id = ? AND user_id = ? "
+            "AND status = 'pending' ORDER BY id DESC LIMIT 1",
+            (guild_id, user_id),
+        )
+        return await cur.fetchone()
+
+    async def close_risk_review(self, review_id: int, status: str) -> bool:
+        """条件更新：仅当工单仍处于 pending 时置为目标状态。
+
+        返回是否更新成功——管理员按钮与后台超时扫描以此防止重复处置。
+        """
+        cur = await self.conn.execute(
+            "UPDATE risk_reviews SET status = ? WHERE id = ? AND status = 'pending'",
+            (status, review_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def list_pending_risk_reviews(self) -> list:
+        """全部待处理工单（启动时恢复处理按钮用）。"""
+        cur = await self.conn.execute(
+            "SELECT * FROM risk_reviews WHERE status = 'pending' ORDER BY id"
+        )
+        return await cur.fetchall()
+
+    async def list_expired_risk_reviews(self, now: float) -> list:
+        """已超过处理时限仍未处理的工单（后台扫描自动封禁用）。"""
+        cur = await self.conn.execute(
+            "SELECT * FROM risk_reviews WHERE status = 'pending' AND deadline <= ?",
+            (now,),
         )
         return await cur.fetchall()
 
