@@ -18,6 +18,11 @@ from ..tracing import inject_trace
 log = logging.getLogger("repo-bot")
 
 
+# 「永久」封禁使用的时长（约 100 年）；剩余时间超过阈值一半即按永久显示
+PERMANENT_BAN_HOURS = 876000
+PERMANENT_BAN_SECONDS = PERMANENT_BAN_HOURS * 3600 / 2
+
+
 def fmt_duration(seconds: float) -> str:
     """把秒数格式化为「X 小时 X 分钟」。"""
     s = max(0, int(seconds))
@@ -28,6 +33,14 @@ def fmt_duration(seconds: float) -> str:
     if m:
         return f"{m} 分钟"
     return f"{s} 秒"
+
+
+def fmt_ban_remaining(banned_until: float) -> str:
+    """封禁剩余时间的人类可读形式；接近永久时长时显示「永久」。"""
+    remaining = banned_until - time.time()
+    if remaining >= PERMANENT_BAN_SECONDS:
+        return "永久"
+    return f"{fmt_duration(remaining)}后解除"
 
 
 def build_storage_embed(
@@ -364,16 +377,14 @@ class AppealVoteView(discord.ui.View):
             )
             await self.bot.db.conn.commit()
 
-        try:
-            user = await self.bot.fetch_user(self.user_id)
-            await user.send(
-                "✅ 你的解封申诉已通过，限制已解除。"
-                if approved
-                else "❌ 你的解封申诉被驳回，封禁继续生效，到期自动解除。"
-            )
-        except discord.HTTPException:
-            pass
         guild = self.bot.get_guild(self.guild_id)
+        server = f"服务器「{guild.name}」" if guild is not None else "该服务器"
+        await self.bot.dm_user(
+            self.user_id,
+            f"✅ 你在{server}的解封申诉已通过，限制已解除。"
+            if approved
+            else f"❌ 你在{server}的解封申诉被驳回，封禁继续生效，到期自动解除。",
+        )
         if guild is not None:
             await self.bot.log_admin(
                 guild,
@@ -491,7 +502,7 @@ class RiskReviewView(discord.ui.View):
                 "⚠️ 该工单已被处理（可能已超时自动封禁）。", ephemeral=True
             )
             return
-        dm_text = None
+        server = f"服务器「{interaction.guild.name}」"
         if action == "ban":
             until = await self.bot.db.ban_user(
                 self.guild_id, self.user_id, self.ban_hours, self.reason
@@ -503,25 +514,24 @@ class RiskReviewView(discord.ui.View):
             )
             color = discord.Color.red()
             dm_text = (
-                f"⛔ 你因异常下载行为（{self.reason}）已被管理员封禁 {duration}。"
-                "如有异议可到服务器内使用 `/appeal` 申诉。"
+                f"⛔ 你在{server}因异常下载行为（{self.reason}）已被管理员封禁 "
+                f"{duration}。如有异议可到服务器内使用 `/appeal` 申诉。"
             )
             log_text = f"⛔ 处理风控工单：手动封禁 <@{self.user_id}> {duration}"
         else:
             result = f"✅ 已由 {interaction.user.mention} 放行，不予处理"
             color = discord.Color.green()
+            dm_text = (
+                f"✅ 你在{server}的异常下载行为（{self.reason}）工单已由管理员处理："
+                "放行，不会对你进行限制。"
+            )
             log_text = f"✅ 处理风控工单：放行 <@{self.user_id}>"
         self._disable()
         await interaction.response.edit_message(
             embed=self._result_embed(interaction.message, result, color), view=self
         )
         self.stop()
-        if dm_text is not None:
-            try:
-                user = await self.bot.fetch_user(self.user_id)
-                await user.send(dm_text)
-            except discord.HTTPException:
-                pass
+        await self.bot.dm_user(self.user_id, dm_text)
         await self.bot.log_admin(interaction.guild, interaction.user, log_text)
 
 
@@ -595,6 +605,8 @@ class FilesCog(commands.Cog, name="文件"):
             "风控工单超时自动封禁：guild=%s user=%s hours=%s",
             row["guild_id"], row["user_id"], row["ban_hours"],
         )
+        guild = self.bot.get_guild(row["guild_id"])
+        server = f"服务器「{guild.name}」" if guild is not None else "该服务器"
         # 编辑通知消息：标记已自动封禁并移除按钮
         channel = (
             self.bot.get_channel(row["channel_id"]) if row["channel_id"] else None
@@ -619,15 +631,11 @@ class FilesCog(commands.Cog, name="文件"):
                 await msg.edit(embed=embed, view=None)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
-        try:
-            user = await self.bot.fetch_user(row["user_id"])
-            await user.send(
-                f"⛔ 你因异常下载行为（{row['reason']}）已被自动封禁 {duration}"
-                "（管理员超时未处理）。如有异议可到服务器内使用 `/appeal` 申诉。"
-            )
-        except discord.HTTPException:
-            pass
-        guild = self.bot.get_guild(row["guild_id"])
+        await self.bot.dm_user(
+            row["user_id"],
+            f"⛔ 你在{server}因异常下载行为（{row['reason']}）已被自动封禁 {duration}"
+            "（管理员超时未处理）。如有异议可到服务器内使用 `/appeal` 申诉。",
+        )
         if guild is not None and self.bot.user is not None:
             await self.bot.log_admin(
                 guild, self.bot.user,
@@ -639,10 +647,9 @@ class FilesCog(commands.Cog, name="文件"):
         ban = await self._check_ban(interaction)
         if ban is None:
             return True
-        remaining = fmt_duration(ban["banned_until"] - time.time())
         try:
             await interaction.response.send_message(
-                f"⛔ 你已被风控限制，**{remaining}**后解除。\n"
+                f"⛔ 你已被限制使用 Bot（{fmt_ban_remaining(ban['banned_until'])}）。\n"
                 f"原因：{ban['reason']}\n"
                 "如有异议可使用 `/appeal` 提交申诉工单。",
                 ephemeral=True,
@@ -987,7 +994,9 @@ class FilesCog(commands.Cog, name="文件"):
         ban = await self._check_ban(interaction)
         if ban is not None:
             await interaction.followup.send(
-                "⛔ 你已被风控限制，暂时无法使用 Bot。", ephemeral=True
+                f"⛔ 你已被限制使用 Bot（{fmt_ban_remaining(ban['banned_until'])}），"
+                "暂时无法下载。",
+                ephemeral=True,
             )
             return
         storage_channel = self.bot.get_channel(record["storage_channel_id"])

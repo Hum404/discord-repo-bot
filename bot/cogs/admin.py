@@ -11,7 +11,11 @@ from discord.ext import commands
 
 from ..bot import STORAGE_CHANNEL_NAME, RepoBot, fmt_size
 from ..tracing import extract_trace
-from .files import build_storage_embed
+from .files import (
+    PERMANENT_BAN_HOURS,
+    build_storage_embed,
+    fmt_duration,
+)
 
 log = logging.getLogger("repo-bot")
 
@@ -1115,6 +1119,138 @@ class AdminCog(commands.Cog, name="管理"):
         )
         await self.bot.log_admin(
             interaction.guild, interaction.user, f"🎫 设置工单频道：#{channel.name}"
+        )
+
+    # ───────────────────── 手动禁用 / 解除禁用 ─────────────────────
+
+    @app_commands.command(
+        name="ban_user", description="直接禁用成员使用 Bot 的全部指令（管理员）"
+    )
+    @app_commands.describe(
+        member="要禁用的成员",
+        hours="禁用时长（小时，可填 0.5）；不填或填 0 表示永久禁用",
+        reason="禁用原因（会私信告知该成员）",
+    )
+    @admin_only
+    async def ban_user(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        hours: float | None = None,
+        reason: str | None = None,
+    ):
+        assert interaction.guild is not None
+        if member.id == interaction.user.id:
+            await interaction.response.send_message("❌ 不能禁用你自己。", ephemeral=True)
+            return
+        if member.bot:
+            await interaction.response.send_message("❌ 不能禁用 Bot 账号。", ephemeral=True)
+            return
+        existing = await self.bot.db.get_active_ban(interaction.guild.id, member.id)
+        if existing is not None:
+            await interaction.response.send_message(
+                f"⚠️ {member.mention} 已在禁用中（原因：{existing['reason']}），"
+                "如需调整请先 `/unban_user` 解除后再重新禁用。",
+                ephemeral=True,
+            )
+            return
+
+        reason_text = (reason or "").strip() or "管理员手动禁用"
+        permanent = hours is None or hours <= 0
+        ban_hours = PERMANENT_BAN_HOURS if permanent else float(hours)
+        until = await self.bot.db.ban_user(
+            interaction.guild.id, member.id, ban_hours, reason_text
+        )
+        duration = "永久" if permanent else fmt_duration(ban_hours * 3600)
+
+        # 该成员若有待处理风控工单，一并关闭，避免超时扫描重复封禁覆盖本次设置
+        ticket_note = ""
+        pending = await self.bot.db.get_pending_risk_review(
+            interaction.guild.id, member.id
+        )
+        if pending is not None and await self.bot.db.close_risk_review(
+            pending["id"], "banned"
+        ):
+            ticket_note = "\n🎫 该成员的待处理风控工单已一并关闭。"
+            ch = (
+                interaction.guild.get_channel(pending["channel_id"])
+                if pending["channel_id"]
+                else None
+            )
+            if isinstance(ch, discord.TextChannel) and pending["message_id"]:
+                try:
+                    msg = await ch.fetch_message(pending["message_id"])
+                    embed = (
+                        msg.embeds[0]
+                        if msg.embeds
+                        else discord.Embed(title="🚨 风控异常待处理")
+                    )
+                    embed.color = discord.Color.red()
+                    embed.add_field(
+                        name="处理结果",
+                        value=(
+                            f"⛔ 已由 {interaction.user.mention} 通过 `/ban_user` "
+                            "手动禁用，本工单关闭"
+                        ),
+                        inline=False,
+                    )
+                    await msg.edit(embed=embed, view=None)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+
+        dm_ok = await self.bot.dm_user(
+            member.id,
+            f"⛔ 你已被服务器「{interaction.guild.name}」的管理员禁用文件仓库 Bot，"
+            f"期限：**{duration}**"
+            + ("" if permanent else f"（<t:{int(until)}:R> 解除）")
+            + f"。\n原因：{reason_text}\n如有异议可到服务器内使用 `/appeal` 提交申诉。",
+        )
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            f"🚫 手动禁用成员：{member} (`{member.id}`)，期限 {duration}，"
+            f"原因：{reason_text}"
+            + ("（同时关闭其待处理风控工单）" if ticket_note else ""),
+        )
+        note = ticket_note
+        if member.guild_permissions.administrator:
+            note += "\n⚠️ 该成员拥有管理员权限，禁用不会限制其指令使用。"
+        if not dm_ok:
+            note += "\n📭 私信未送达（对方可能关闭了私信）。"
+        await interaction.response.send_message(
+            f"🚫 已禁用 {member.mention} 使用 Bot，期限：**{duration}**"
+            + ("" if permanent else f"（<t:{int(until)}:R> 解除）")
+            + f"\n原因：{reason_text}{note}",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="unban_user", description="解除成员的 Bot 使用禁用（管理员）"
+    )
+    @app_commands.describe(member="要解除禁用的成员")
+    @admin_only
+    async def unban_user(self, interaction: discord.Interaction, member: discord.Member):
+        assert interaction.guild is not None
+        existing = await self.bot.db.get_active_ban(interaction.guild.id, member.id)
+        if existing is None:
+            await interaction.response.send_message(
+                f"ℹ️ {member.mention} 当前没有生效中的禁用。", ephemeral=True
+            )
+            return
+        await self.bot.db.unban_user(interaction.guild.id, member.id)
+        dm_ok = await self.bot.dm_user(
+            member.id,
+            f"✅ 你在服务器「{interaction.guild.name}」的 Bot 使用禁用已被管理员解除，"
+            "现在可以正常使用指令了。",
+        )
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            f"✅ 手动解除禁用：{member} (`{member.id}`)（原原因：{existing['reason']}）",
+        )
+        note = "" if dm_ok else "\n📭 私信未送达（对方可能关闭了私信）。"
+        await interaction.response.send_message(
+            f"✅ 已解除 {member.mention} 的 Bot 使用禁用。{note}", ephemeral=True
         )
 
     async def run_organize(
