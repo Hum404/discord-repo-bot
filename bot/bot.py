@@ -171,6 +171,18 @@ class RepoBot(commands.Bot):
             except discord.Forbidden:
                 pass
 
+    async def dm_user(self, user_id: int, content: str) -> bool:
+        """私信通知用户。对方关闭私信等情况失败时返回 False，不抛异常。"""
+        try:
+            user = await self.fetch_user(user_id)
+            await user.send(content)
+            return True
+        except discord.HTTPException:
+            return False
+        except Exception:
+            log.warning("私信用户 %s 失败", user_id, exc_info=True)
+            return False
+
     async def log_admin(
         self,
         guild: discord.Guild,
