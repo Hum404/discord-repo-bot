@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from .config import Config
@@ -25,8 +26,34 @@ class RepoBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.db.connect()
+        self.tree.on_error = self._on_app_command_error
         await self.load_extension("bot.cogs.files")
         await self.load_extension("bot.cogs.admin")
+
+    async def _on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        """全局指令错误处理：避免异常时用户只能看到「应用程序未响应」。"""
+        if isinstance(error, app_commands.MissingPermissions):
+            text = "❌ 需要管理员权限才能使用该指令。"
+        elif isinstance(error, app_commands.NoPrivateMessage):
+            text = "❌ 该指令只能在服务器中使用。"
+        elif isinstance(error, app_commands.CheckFailure):
+            text = "❌ 你无法使用该指令。"
+        else:
+            log.exception(
+                "指令 /%s 执行失败",
+                interaction.command.name if interaction.command else "?",
+                exc_info=error,
+            )
+            text = "❌ 指令执行出错，请重试；持续失败请联系管理员查看 Bot 日志。"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
     async def on_ready(self) -> None:
         assert self.user is not None
@@ -37,7 +64,7 @@ class RepoBot(commands.Bot):
                 self.tree.copy_global_to(guild=guild)
                 await self.tree.sync(guild=guild)
                 log.info("指令已同步到服务器：%s", guild.name)
-            except discord.HTTPException as exc:
+            except Exception as exc:
                 log.warning("同步指令到 %s 失败：%s", guild.name, exc)
 
     async def close(self) -> None:
