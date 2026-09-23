@@ -3,18 +3,24 @@
 下载时在文件副本中写入「下载者 ID + 时间」标记，每个下载者的副本都不同：
 - ZIP 系（zip/apk/jar/docx/xlsx/pptx/epub 等）：写入 ZIP comment
   （不影响使用，不破坏 APK v2 签名，解压重打包会丢失）
-- 文本类（txt/md/json/py 等）：末尾追加零宽字符编码（肉眼不可见）
-- 图片类（png/jpg/webp/bmp）：右下角半透明水印（需 Pillow，威慑力最强）
+- PNG 角色卡（含 chara tEXt 块，如 SillyTavern 卡）：注入独立 tEXt 元数据块
+  （不动像素、不重编码、不丢 chara 数据，导入角色卡软件不受影响）
+- JSON / JSON 角色卡：解析后写入 extensions.trc 字段
+  （不破坏 JSON 结构，V2 卡写入 data.extensions.trc）
+- 文本类（txt/md/py 等）：末尾追加零宽字符编码（肉眼不可见）
+- 图片类（png/jpg/webp/bmp，非角色卡）：右下角半透明水印（需 Pillow）
 
 标记 payload 格式：TRC|<用户ID>|<unix时间戳>
 """
 from __future__ import annotations
 
 import io
+import json
 import logging
 import re
 import time
 import zipfile
+import zlib
 
 log = logging.getLogger("repo-bot")
 
@@ -27,8 +33,10 @@ except ImportError:  # 未安装 Pillow 时跳过图片水印
 
 TRACE_PREFIX = "TRC|"
 _TRACE_RE = re.compile(r"TRC\|(\d+)\|(\d+)")
+_TRACE_BYTES_RE = re.compile(rb"TRC\|(\d+)\|(\d+)")
 
 ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 TEXT_EXTS = {
     ".txt", ".md", ".json", ".py", ".js", ".ts", ".html", ".htm", ".css",
@@ -95,6 +103,69 @@ def _extract_zip(data: bytes) -> tuple[str, str] | None:
         return None
     m = _TRACE_RE.search(comment)
     return (m.group(1), m.group(2)) if m else None
+
+
+# ───────────────────── PNG 角色卡（tEXt 元数据块） ─────────────────────
+
+
+def _iter_png_chunks(data: bytes):
+    """遍历 PNG 块，产出 (类型, 数据, 块起始偏移)。"""
+    off = len(PNG_SIG)
+    while off + 8 <= len(data):
+        length = int.from_bytes(data[off:off + 4], "big")
+        ctype = data[off + 4:off + 8]
+        cdata = data[off + 8:off + 8 + length]
+        if off + 12 + length > len(data):
+            break
+        yield ctype, cdata, off
+        off += 12 + length
+        if ctype == b"IEND":
+            break
+
+
+def _png_is_chara_card(data: bytes) -> bool:
+    """是否为 PNG 角色卡：存在 keyword 为 chara 的 tEXt/zTXt 块。"""
+    if not data.startswith(PNG_SIG):
+        return False
+    for ctype, cdata, _ in _iter_png_chunks(data):
+        if ctype in (b"tEXt", b"zTXt"):
+            if cdata.split(b"\x00", 1)[0].strip().lower() == b"chara":
+                return True
+    return False
+
+
+def _inject_png_chunk(data: bytes, payload: str) -> bytes | None:
+    """在 IEND 前插入 keyword=trc 的 tEXt 块。不重编码图像，保留全部原有块。"""
+    iend_type = data.rfind(b"IEND")
+    if iend_type < 4:
+        return None
+    cdata = b"trc\x00" + payload.encode("utf-8")
+    chunk = (
+        len(cdata).to_bytes(4, "big")
+        + b"tEXt"
+        + cdata
+        + (zlib.crc32(b"tEXt" + cdata) & 0xFFFFFFFF).to_bytes(4, "big")
+    )
+    return data[:iend_type - 4] + chunk + data[iend_type - 4:]
+
+
+# ───────────────────── JSON 角色卡 / JSON 文件 ─────────────────────
+
+
+def _inject_json(text: str, payload: str) -> str | None:
+    """向 JSON 对象注入 extensions.trc 字段（V2 卡写入 data.extensions）。"""
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    node = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+    ext = node.setdefault("extensions", {})
+    if not isinstance(ext, dict):
+        return None
+    ext["trc"] = payload
+    return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
 # ───────────────────── 图片水印 ─────────────────────
@@ -226,6 +297,21 @@ def inject_trace(
         if out is not None:
             return out, True
 
+    # PNG 角色卡：注入 tEXt 元数据块（不动像素、不打可见水印、不丢 chara 数据）
+    if data.startswith(PNG_SIG) and _png_is_chara_card(data):
+        out = _inject_png_chunk(data, payload)
+        if out is not None:
+            return out, True
+
+    # JSON / JSON 角色卡：注入 extensions.trc 字段（保持 JSON 可解析）
+    if ext == ".json":
+        try:
+            out_text = _inject_json(data.decode("utf-8"), payload)
+        except UnicodeDecodeError:
+            out_text = None
+        if out_text is not None:
+            return out_text.encode("utf-8"), True
+
     # 图片：右下角可见水印
     if _PIL and (ext in IMAGE_EXTS or (content_type or "").startswith("image/")):
         out = _inject_image(data, user_id, user_name, ts)
@@ -255,6 +341,11 @@ def extract_trace(data: bytes, filename: str):
         if got:
             return ("hit", got[0], got[1])
 
+    # 明文标记：PNG tEXt 块、JSON 字段、ZIP comment 等都是明文 TRC|id|ts
+    m = _TRACE_BYTES_RE.search(data)
+    if m:
+        return ("hit", m.group(1).decode(), m.group(2).decode())
+
     ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
     if ext in TEXT_EXTS or data[:4] not in ZIP_MAGICS:
         try:
@@ -269,5 +360,8 @@ def extract_trace(data: bytes, filename: str):
                     return ("hit", m.group(1), m.group(2))
 
     if ext in IMAGE_EXTS:
+        # PNG 角色卡走元数据块注入而非水印，无标记时提示"未命中"而非"看右下角"
+        if data.startswith(PNG_SIG) and _png_is_chara_card(data):
+            return ("none",)
         return ("image",)
     return ("none",)
