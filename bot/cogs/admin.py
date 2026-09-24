@@ -9,8 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..bot import STORAGE_CHANNEL_NAME, RepoBot, fmt_size
-from ..tracing import extract_trace
+from ..bot import STORAGE_CATEGORY_NAME, STORAGE_CHANNEL_NAME, RepoBot, fmt_size
 from .files import (
     PERMANENT_BAN_HOURS,
     build_storage_embed,
@@ -21,12 +20,10 @@ log = logging.getLogger("repo-bot")
 
 admin_only = app_commands.checks.has_permissions(administrator=True)
 
-# /organize 投票通过所需的管理员同意人数
-ORGANIZE_VOTES_CATEGORY = 2
-ORGANIZE_VOTES_GUILD = 3
-
-# /reset_server 初始化通过所需的管理员同意人数
-RESET_VOTES_REQUIRED = 3
+# 各类管理员投票的默认所需同意人数（可用 /vote_config 按服务器调整，范围 1~20）
+DEFAULT_ORGANIZE_VOTES_CATEGORY = 2
+DEFAULT_ORGANIZE_VOTES_GUILD = 3
+DEFAULT_RESET_VOTES_REQUIRED = 3
 
 
 class OrganizeVoteView(discord.ui.View):
@@ -360,7 +357,7 @@ class OrganizeConfirmView(discord.ui.View):
                 f"{mode_text}名单 {len(self.channels)} 个频道 · 失败 {stats['failed']}",
             )
             if stats["failed"]:
-                desc += f"\n⚠️ 失败 {stats['failed']} 个（详情见运行日志）"
+                desc += f"\n⚠️ 失败 {stats['failed']} 个（详情见运行日志 logs/bot.log）"
             if self.message:
                 await self.message.edit(
                     embed=discord.Embed(
@@ -552,6 +549,90 @@ class RiskConfigView(discord.ui.View):
         await interaction.response.send_modal(RiskConfigModal(self))
 
 
+class VoteConfigModal(discord.ui.Modal, title="🗳️ 投票人数设置"):
+    """各类管理员投票所需的同意人数（1~20）。"""
+
+    def __init__(self, view: "VoteConfigView"):
+        super().__init__()
+        self.view = view
+        cfg = view.cfg
+        self.organize_category = discord.ui.TextInput(
+            label="一键整理·当前子区（默认 2）", default=str(cfg["organize_category"]),
+            min_length=1, max_length=2,
+        )
+        self.organize_guild = discord.ui.TextInput(
+            label="一键整理·整个服务器（默认 3）", default=str(cfg["organize_guild"]),
+            min_length=1, max_length=2,
+        )
+        self.reset = discord.ui.TextInput(
+            label="初始化服务器（默认 3）", default=str(cfg["reset"]),
+            min_length=1, max_length=2,
+        )
+        self.appeal = discord.ui.TextInput(
+            label="申诉工单·解封/驳回各需（默认 2）", default=str(cfg["appeal"]),
+            min_length=1, max_length=2,
+        )
+        for item in (self.organize_category, self.organize_guild, self.reset, self.appeal):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            values = {
+                "organize_category": int(self.organize_category.value),
+                "organize_guild": int(self.organize_guild.value),
+                "reset": int(self.reset.value),
+                "appeal": int(self.appeal.value),
+            }
+            if any(v < 1 or v > 20 for v in values.values()):
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ 参数格式不正确：票数需为 1~20 的整数。", ephemeral=True
+            )
+            return
+        await self.view.cog.bot.db.set_vote_config(interaction.guild.id, **values)
+        self.view.cfg = await self.view.cog.bot.db.get_vote_config(interaction.guild.id)
+        await interaction.response.edit_message(
+            embed=self.view.make_embed(), view=self.view
+        )
+        await self.view.cog.bot.log_admin(
+            interaction.guild, interaction.user,
+            "🗳️ 修改投票人数："
+            f"整理·子区 {values['organize_category']} 票 · "
+            f"整理·全服 {values['organize_guild']} 票 · "
+            f"初始化 {values['reset']} 票 · 申诉 {values['appeal']} 票",
+        )
+
+
+class VoteConfigView(discord.ui.View):
+    """投票人数配置面板（/vote_config）。"""
+
+    def __init__(self, cog: "AdminCog", cfg: dict):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.cfg = dict(cfg)
+
+    def make_embed(self) -> discord.Embed:
+        cfg = self.cfg
+        return discord.Embed(
+            title="🗳️ 管理员投票人数配置",
+            description=(
+                "以下投票均由管理员点击按钮计数，**发起者自动计 1 票**，\n"
+                "集齐所需人数即通过（范围 1~20，仅本服务器生效）：\n\n"
+                f"🗂️ 一键整理·当前子区：**{cfg['organize_category']}** 票\n"
+                f"🗂️ 一键整理·整个服务器：**{cfg['organize_guild']}** 票\n"
+                f"⚠️ 初始化服务器 /reset_server：**{cfg['reset']}** 票\n"
+                f"🎫 申诉工单解封/驳回：各 **{cfg['appeal']}** 票\n\n"
+                "点击「修改票数」按钮进行调整。"
+            ),
+            color=discord.Color.blurple(),
+        )
+
+    @discord.ui.button(label="修改票数", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def edit_votes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(VoteConfigModal(self))
+
+
 class ResetVoteView(discord.ui.View):
     """初始化投票：集齐 3 名管理员同意后执行服务器初始化。"""
 
@@ -561,13 +642,14 @@ class ResetVoteView(discord.ui.View):
         guild: discord.Guild,
         initiator: discord.Member,
         delete_files: bool,
+        required: int = DEFAULT_RESET_VOTES_REQUIRED,
     ):
         super().__init__(timeout=600)
         self.cog = cog
         self.guild = guild
         self.initiator = initiator
         self.delete_files = delete_files
-        self.required = RESET_VOTES_REQUIRED
+        self.required = required
         self.voters: set[int] = {initiator.id}
         self.message: discord.Message | None = None
 
@@ -888,52 +970,6 @@ class AdminCog(commands.Cog, name="管理"):
             embed.set_footer(text=f"最多显示最近 {len(rows)} 条")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ───────────────────── 文件溯源反查 ─────────────────────
-
-    @app_commands.command(name="trace", description="溯源查询：读取疑似外泄文件中的下载标记（管理员）")
-    @app_commands.describe(file="要检查的文件（把外泄的文件传上来）")
-    @admin_only
-    async def trace(self, interaction: discord.Interaction, file: discord.Attachment):
-        assert interaction.guild is not None
-        await interaction.response.defer(ephemeral=True)
-        if file.size > 50 * 1024 * 1024:
-            await interaction.followup.send("❌ 文件过大，无法检查。", ephemeral=True)
-            return
-        try:
-            data = await asyncio.wait_for(file.read(), timeout=120)
-        except Exception:
-            await interaction.followup.send(
-                "❌ 读取附件失败（Discord CDN 连接异常或超时），请重试。", ephemeral=True
-            )
-            return
-
-        result = extract_trace(data, file.filename)
-        if result[0] == "hit":
-            _, uid, ts = result
-            desc = (
-                f"🎯 **溯源命中！**\n"
-                f"下载者：<@{uid}>（`{uid}`）\n"
-                f"下载时间：<t:{ts}:F>"
-            )
-            action = f"🔍 溯源 `{file.filename}` → 命中 <@{uid}>"
-        elif result[0] == "image":
-            desc = "该文件是图片：水印为可见文字，请直接查看图片**右下角**的 ID 和时间。"
-            action = f"🔍 溯源 `{file.filename}` → 图片水印（需人工查看）"
-        else:
-            desc = (
-                "未在该文件中发现溯源标记。\n"
-                "可能原因：文件类型不支持标记、标记已被破坏（重打包/转码/截图），"
-                "或文件不是从本仓库下载的。"
-            )
-            action = f"🔍 溯源 `{file.filename}` → 未命中"
-        await self.bot.log_admin(interaction.guild, interaction.user, action)
-        await interaction.followup.send(
-            embed=discord.Embed(
-                title="🔍 文件溯源", description=desc, color=discord.Color.gold()
-            ),
-            ephemeral=True,
-        )
-
     # ───────────────────── 仓库统计 ─────────────────────
 
     @app_commands.command(name="stats", description="查看仓库统计信息（管理员）")
@@ -973,18 +1009,20 @@ class AdminCog(commands.Cog, name="管理"):
     @app_commands.describe(scope="整理范围")
     @app_commands.choices(
         scope=[
-            app_commands.Choice(name="当前子区（需 2 名管理员同意）", value="category"),
-            app_commands.Choice(name="整个服务器（需 3 名管理员同意）", value="guild"),
+            app_commands.Choice(name="当前子区", value="category"),
+            app_commands.Choice(name="整个服务器", value="guild"),
         ]
     )
     @admin_only
     async def organize(self, interaction: discord.Interaction, scope: app_commands.Choice[str]):
         assert interaction.guild is not None and isinstance(interaction.user, discord.Member)
-        if interaction.guild.id in self._organizing:
+        guild = interaction.guild
+        if guild.id in self._organizing:
             await interaction.response.send_message(
                 "❌ 当前已有整理任务在执行，请等待其完成。", ephemeral=True
             )
             return
+        vote_cfg = await self.bot.db.get_vote_config(guild.id)
 
         if scope.value == "category":
             business_cat = (
@@ -1017,12 +1055,12 @@ class AdminCog(commands.Cog, name="管理"):
             # 迁移过滤用存储侧频道；扫描散落文件用业务侧频道
             channel_ids = {c.id for c in cat.text_channels}
             scan_channel_ids = {c.id for c in business_cat.text_channels}
-            required = ORGANIZE_VOTES_CATEGORY
+            required = vote_cfg["organize_category"]
             scope_label = f"当前子区「{business_cat.name}」"
         else:
             channel_ids = None
             scan_channel_ids = None
-            required = ORGANIZE_VOTES_GUILD
+            required = vote_cfg["organize_guild"]
             scope_label = "整个服务器"
 
         # ── 预扫描：统计本次将处理的文件，供投票与范围确认参考 ──
@@ -1097,6 +1135,19 @@ class AdminCog(commands.Cog, name="管理"):
         assert interaction.guild is not None
         cfg = await self.bot.db.get_risk_config(interaction.guild.id)
         view = RiskConfigView(self, cfg)
+        await interaction.response.send_message(
+            embed=view.make_embed(), view=view, ephemeral=True
+        )
+
+    @app_commands.command(
+        name="vote_config",
+        description="配置各类投票所需的管理员同意人数：整理 / 初始化 / 申诉（管理员）",
+    )
+    @admin_only
+    async def vote_config(self, interaction: discord.Interaction):
+        assert interaction.guild is not None
+        cfg = await self.bot.db.get_vote_config(interaction.guild.id)
+        view = VoteConfigView(self, cfg)
         await interaction.response.send_message(
             embed=view.make_embed(), view=view, ephemeral=True
         )
@@ -1448,7 +1499,7 @@ class AdminCog(commands.Cog, name="管理"):
 
     @app_commands.command(
         name="reset_server",
-        description="初始化本服务器：清空数据，Bot 恢复到刚加入时的状态（需 3 名管理员同意）",
+        description="初始化本服务器：清空数据，Bot 恢复到刚加入时的状态（需管理员投票，人数见 /vote_config）",
     )
     @app_commands.describe(mode="初始化模式")
     @app_commands.choices(
@@ -1465,8 +1516,10 @@ class AdminCog(commands.Cog, name="管理"):
                 "❌ 当前已有整理/初始化任务在执行，请等待其完成。", ephemeral=True
             )
             return
+        vote_cfg = await self.bot.db.get_vote_config(interaction.guild.id)
         view = ResetVoteView(
-            self, interaction.guild, interaction.user, delete_files=(mode.value == "full")
+            self, interaction.guild, interaction.user,
+            delete_files=(mode.value == "full"), required=vote_cfg["reset"],
         )
         await interaction.response.send_message(
             embed=view.make_embed("⚠️ 初始化投票"), view=view

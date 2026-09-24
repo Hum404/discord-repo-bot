@@ -48,7 +48,7 @@ class RepoBot(commands.Bot):
                 interaction.command.name if interaction.command else "?",
                 exc_info=error,
             )
-            text = "❌ 指令执行出错，请重试；持续失败请联系管理员查看 Bot 日志。"
+            text = "❌ 指令执行出错，请重试；持续失败请联系管理员查看 Bot 运行日志（logs/bot.log）。"
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(text, ephemeral=True)

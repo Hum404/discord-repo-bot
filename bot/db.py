@@ -2,7 +2,7 @@
 
 三张表：
 - files     : 文件元数据 + 存储消息定位
-- downloads : 每一次下载行为（溯源核心）
+- downloads : 每一次下载行为（审计核心）
 - settings  : 每个业务服务器的存储配置
 
 风控相关：
@@ -36,7 +36,6 @@ CREATE TABLE IF NOT EXISTS files (
     storage_message_id INTEGER NOT NULL,
     download_count     INTEGER NOT NULL DEFAULT 0,
     password           TEXT,
-    trace_enabled      INTEGER NOT NULL DEFAULT 1,
     seq                INTEGER
 );
 
@@ -68,7 +67,11 @@ CREATE TABLE IF NOT EXISTS settings (
     risk_ban_hours       REAL NOT NULL DEFAULT 1,        -- 触发后封禁时长（小时）
     risk_action_mode     TEXT NOT NULL DEFAULT 'auto',   -- 触发处置：'auto' 自动封禁 | 'review' 通知管理员
     risk_review_minutes  INTEGER NOT NULL DEFAULT 30,    -- 通知模式下管理员处理时限（分钟），超时自动封禁
-    ticket_channel_id    INTEGER                         -- 申诉工单发送频道
+    ticket_channel_id    INTEGER,                        -- 申诉工单发送频道
+    vote_organize_category INTEGER NOT NULL DEFAULT 2,   -- /organize 当前子区所需管理员同意人数
+    vote_organize_guild    INTEGER NOT NULL DEFAULT 3,   -- /organize 整个服务器所需管理员同意人数
+    vote_reset             INTEGER NOT NULL DEFAULT 3,   -- /reset_server 所需管理员同意人数
+    vote_appeal            INTEGER NOT NULL DEFAULT 2    -- /appeal 工单解封/驳回各需票数
 );
 
 CREATE TABLE IF NOT EXISTS bans (
@@ -136,7 +139,6 @@ class Database:
         for migration in (
             "ALTER TABLE files ADD COLUMN seq INTEGER",
             "ALTER TABLE files ADD COLUMN password TEXT",
-            "ALTER TABLE files ADD COLUMN trace_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE settings ADD COLUMN admin_log_channel_id INTEGER",
             "ALTER TABLE settings ADD COLUMN organize_mode TEXT NOT NULL DEFAULT 'black'",
             "ALTER TABLE settings ADD COLUMN organize_channels TEXT NOT NULL DEFAULT '[]'",
@@ -147,6 +149,10 @@ class Database:
             "ALTER TABLE settings ADD COLUMN risk_action_mode TEXT NOT NULL DEFAULT 'auto'",
             "ALTER TABLE settings ADD COLUMN risk_review_minutes INTEGER NOT NULL DEFAULT 30",
             "ALTER TABLE settings ADD COLUMN ticket_channel_id INTEGER",
+            "ALTER TABLE settings ADD COLUMN vote_organize_category INTEGER NOT NULL DEFAULT 2",
+            "ALTER TABLE settings ADD COLUMN vote_organize_guild INTEGER NOT NULL DEFAULT 3",
+            "ALTER TABLE settings ADD COLUMN vote_reset INTEGER NOT NULL DEFAULT 3",
+            "ALTER TABLE settings ADD COLUMN vote_appeal INTEGER NOT NULL DEFAULT 2",
         ):
             try:
                 await self._conn.execute(migration)
@@ -239,6 +245,44 @@ class Database:
             organize_mode=mode,
             organize_channels=json.dumps([int(x) for x in channel_ids]),
         )
+
+    # ────────────────────────── 投票人数配置 ──────────────────────────
+
+    # 各类管理员投票所需同意人数的默认值与取值范围（1~20）
+    VOTE_DEFAULTS = {
+        "organize_category": 2,  # /organize 当前子区
+        "organize_guild": 3,     # /organize 整个服务器
+        "reset": 3,              # /reset_server
+        "appeal": 2,             # /appeal 工单解封/驳回各需
+    }
+    VOTE_MIN, VOTE_MAX = 1, 20
+
+    async def get_vote_config(self, guild_id: int) -> dict:
+        """各类投票所需的管理员同意人数（键见 VOTE_DEFAULTS）。"""
+        row = await self.get_settings(guild_id)
+        cfg = dict(self.VOTE_DEFAULTS)
+        if row is not None:
+            keys = row.keys()
+            for name, default in self.VOTE_DEFAULTS.items():
+                col = f"vote_{name}"
+                if col in keys:
+                    try:
+                        value = int(row[col])
+                    except (TypeError, ValueError):
+                        continue
+                    if self.VOTE_MIN <= value <= self.VOTE_MAX:
+                        cfg[name] = value
+        return cfg
+
+    async def set_vote_config(self, guild_id: int, **fields) -> None:
+        """更新投票人数配置；fields 形如 organize_category=3，自动钳制到 1~20。"""
+        allowed = {}
+        for name in self.VOTE_DEFAULTS:
+            if name in fields:
+                value = int(fields[name])
+                allowed[f"vote_{name}"] = min(max(value, self.VOTE_MIN), self.VOTE_MAX)
+        if allowed:
+            await self.upsert_settings(guild_id, **allowed)
 
     # ────────────────────────── 风控（下载频率限制） ──────────────────────────
 
@@ -467,7 +511,6 @@ class Database:
         storage_channel_id: int,
         storage_message_id: int,
         password: str | None = None,
-        trace_enabled: bool = True,
         uploaded_at: int | None = None,
     ) -> tuple[str, int]:
         file_id = new_file_id()
@@ -482,8 +525,8 @@ class Database:
                 INSERT INTO files (
                     file_id, origin_guild_id, name, size, content_type, description,
                     uploader_id, uploader_name, uploaded_at,
-                    storage_channel_id, storage_message_id, password, trace_enabled, seq
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    storage_channel_id, storage_message_id, password, seq
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     file_id,
@@ -498,7 +541,6 @@ class Database:
                     storage_channel_id,
                     storage_message_id,
                     password,
-                    int(trace_enabled),
                     seq,
                 ),
             )
@@ -596,7 +638,7 @@ class Database:
         )
         await self.conn.commit()
 
-    # ────────────────────────── downloads（溯源） ──────────────────────────
+    # ────────────────────────── downloads（下载记录） ──────────────────────────
 
     async def log_download(
         self, *, file_id: str, user_id: int, user_name: str, guild_id: int | None

@@ -2,10 +2,13 @@
 .env
 
 # 数据库
+data/
 *.db
 *.db-journal
 *.sqlite3
-data/
+
+# 运行日志
+logs/
 
 # Python
 __pycache__/

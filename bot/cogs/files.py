@@ -1,4 +1,4 @@
-"""文件相关指令：上传 / 下载（含溯源）/ 列表 / 搜索 / 详情 / 历史 / 删除。"""
+"""文件相关指令：上传 / 下载 / 列表 / 搜索 / 详情 / 历史 / 删除。"""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +13,6 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from ..bot import RepoBot, fmt_size
-from ..tracing import inject_trace
 
 log = logging.getLogger("repo-bot")
 
@@ -139,7 +138,6 @@ class UploadPrepView(discord.ui.View):
         self.original_name = attachment.filename
         self.name = attachment.filename
         self.password: str | None = None
-        self.trace_enabled = True
         self._finished = False
 
     def make_embed(self) -> discord.Embed:
@@ -147,14 +145,9 @@ class UploadPrepView(discord.ui.View):
         if self.name != self.original_name:
             desc += f"✏️ 原名：`{self.original_name}`\n"
         desc += f"🔒 下载密码：{'已设置 ✅' if self.password else '未设置'}\n"
-        desc += (
-            "🔖 下载溯源标记：开启 ✅（下载副本会嵌入下载者标记）\n"
-            if self.trace_enabled
-            else "🔖 下载溯源标记：关闭（下载副本不嵌入标记）\n"
-        )
         if self.description:
             desc += f"📝 描述：{self.description}\n"
-        desc += "\n可点击「设置密码」「重命名」「溯源开关」调整，确认无误后点击「确认上传」。"
+        desc += "\n可点击「设置密码」「重命名」调整，确认无误后点击「确认上传」。"
         return discord.Embed(
             title="📤 上传准备", description=desc, color=discord.Color.blurple()
         )
@@ -178,11 +171,6 @@ class UploadPrepView(discord.ui.View):
     @discord.ui.button(label="重命名", emoji="✏️", style=discord.ButtonStyle.secondary)
     async def rename(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RenameFileModal(self))
-
-    @discord.ui.button(label="溯源开关", emoji="🔖", style=discord.ButtonStyle.secondary)
-    async def toggle_trace(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.trace_enabled = not self.trace_enabled
-        await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
     @discord.ui.button(label="确认上传", emoji="✅", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -244,11 +232,13 @@ class DownloadPasswordModal(discord.ui.Modal, title="🔒 输入下载密码"):
         await self.cog._deliver_file(interaction, record)
 
 
-APPEAL_VOTES_REQUIRED = 2  # 解封/驳回各需的管理员票数
+APPEAL_VOTES_REQUIRED = 2  # 解封/驳回各需的管理员票数（默认值，可用 /vote_config 按服务器调整）
 
 
 class AppealVoteView(discord.ui.View):
-    """解封申诉工单：管理员投票，集齐 2 票同意即解封，2 票拒绝即驳回。
+    """解封申诉工单：管理员投票，同意/拒绝任一方先集齐所需票数即结案。
+
+    所需票数由 /vote_config 按服务器配置（默认 2 票）。
 
     按钮使用固定 custom_id，配合 cog_load 中的 add_view 恢复，
     Bot 重启后历史工单仍可继续投票（票数清零重新计）。
@@ -263,6 +253,7 @@ class AppealVoteView(discord.ui.View):
         banned_until: float,
         appeal_reason: str,
         appeal_id: int | None = None,
+        required: int = APPEAL_VOTES_REQUIRED,
     ):
         super().__init__(timeout=None)
         self.bot = bot
@@ -272,6 +263,7 @@ class AppealVoteView(discord.ui.View):
         self.banned_until = banned_until
         self.appeal_reason = appeal_reason
         self.appeal_id = appeal_id
+        self.required = required
         self.yes_voters: set[int] = set()
         self.no_voters: set[int] = set()
         self.message: discord.Message | None = None
@@ -297,8 +289,8 @@ class AppealVoteView(discord.ui.View):
 
     def _progress_text(self) -> str:
         return (
-            f"✅ 同意解封 {len(self.yes_voters)}/{APPEAL_VOTES_REQUIRED}　"
-            f"❌ 拒绝 {len(self.no_voters)}/{APPEAL_VOTES_REQUIRED}"
+            f"✅ 同意解封 {len(self.yes_voters)}/{self.required}　"
+            f"❌ 拒绝 {len(self.no_voters)}/{self.required}"
         )
 
     def _update_embed(
@@ -340,9 +332,9 @@ class AppealVoteView(discord.ui.View):
             await interaction.response.send_message("你已经投过票了。", ephemeral=True)
             return
         (self.yes_voters if approve else self.no_voters).add(uid)
-        if len(self.yes_voters) >= APPEAL_VOTES_REQUIRED:
+        if len(self.yes_voters) >= self.required:
             await self._finish(interaction, approved=True)
-        elif len(self.no_voters) >= APPEAL_VOTES_REQUIRED:
+        elif len(self.no_voters) >= self.required:
             await self._finish(interaction, approved=False)
         else:
             await interaction.response.edit_message(
@@ -353,10 +345,10 @@ class AppealVoteView(discord.ui.View):
         self._disable()
         result_text = (
             f"✅ 申诉通过，已解除限制（{interaction.user.mention} 等 "
-            f"{APPEAL_VOTES_REQUIRED} 名管理员同意）"
+            f"{self.required} 名管理员同意）"
             if approved
             else f"❌ 申诉驳回，封禁继续生效（{interaction.user.mention} 等 "
-            f"{APPEAL_VOTES_REQUIRED} 名管理员拒绝）"
+            f"{self.required} 名管理员拒绝）"
         )
         embed = self._update_embed(interaction.message, result=result_text)
         embed.color = discord.Color.green() if approved else discord.Color.red()
@@ -547,10 +539,11 @@ class FilesCog(commands.Cog, name="文件"):
             log.exception("读取未结案申诉工单失败")
             return
         for row in rows:
+            vote_cfg = await self.bot.db.get_vote_config(row["guild_id"])
             view = AppealVoteView(
                 self.bot, row["guild_id"], row["user_id"],
                 ban_reason="", banned_until=row["created_at"], appeal_reason="",
-                appeal_id=row["id"],
+                appeal_id=row["id"], required=vote_cfg["appeal"],
             )
             self.bot.add_view(view, message_id=row["message_id"])
         if rows:
@@ -908,7 +901,6 @@ class FilesCog(commands.Cog, name="文件"):
             storage_channel_id=storage.id,
             storage_message_id=storage_msg.id,
             password=prep.password,
-            trace_enabled=prep.trace_enabled,
         )
 
         # 回写文件 ID 到存储消息的 embed，方便管理员对照
@@ -930,22 +922,14 @@ class FilesCog(commands.Cog, name="文件"):
         log_embed.add_field(name="大小", value=fmt_size(len(prep.data)), inline=True)
         if prep.password:
             log_embed.add_field(name="密码保护", value="🔒 是", inline=True)
-        if not prep.trace_enabled:
-            log_embed.add_field(name="溯源标记", value="已关闭 ⚠️", inline=True)
         await self.bot.send_log(guild, log_embed)
 
-        # 管理日志：上传时重命名 / 关闭溯源，均同步记录
+        # 管理日志：上传时重命名同步记录
         if prep.name != prep.original_name:
             await self.bot.log_admin(
                 guild,
                 uploader,
                 f"✏️ 上传时重命名文件：`{prep.original_name}` → `{prep.name}`（编号 `#{seq}`）",
-            )
-        if not prep.trace_enabled:
-            await self.bot.log_admin(
-                guild,
-                uploader,
-                f"⚠️ 上传时关闭了溯源标记：`{prep.name}`（编号 `#{seq}`）",
             )
 
         desc = (
@@ -954,7 +938,6 @@ class FilesCog(commands.Cog, name="文件"):
             f"🆔 文件 ID：`{file_id}`\n"
             f"💾 大小：{fmt_size(len(prep.data))}\n"
             f"🔒 下载密码：{'已设置' if prep.password else '无'}\n"
-            f"🔖 溯源标记：{'开启' if prep.trace_enabled else '关闭'}\n"
             f"📥 下载方式：使用 `/download {seq}` 或 `/download {file_id}`"
         )
         if prep.name != prep.original_name:
@@ -966,7 +949,7 @@ class FilesCog(commands.Cog, name="文件"):
             view=None,
         )
 
-    # ────────────────────────── 下载（溯源核心） ──────────────────────────
+    # ────────────────────────── 下载 ──────────────────────────
 
     @app_commands.command(name="download", description="从仓库下载文件（下载行为会被记录）")
     @app_commands.describe(file_id="文件编号（如 3）或文件 ID（可用 /files 查询）")
@@ -1037,18 +1020,9 @@ class FilesCog(commands.Cog, name="文件"):
             )
             return
 
-        # ── 溯源：向本次下载的副本注入下载者标记（存储原文件不受影响） ──
-        # 图片水印是 CPU 密集操作，放到线程里执行，避免阻塞事件循环
         user = interaction.user
-        if record["trace_enabled"]:
-            data, traced = await asyncio.to_thread(
-                inject_trace,
-                data, record["name"], user.id, str(user), record["content_type"],
-            )
-        else:
-            traced = False
 
-        # ── 溯源：先落库，再发文件 ──
+        # ── 先落库，再发文件 ──
         await self.bot.db.log_download(
             file_id=record["file_id"],
             user_id=user.id,
@@ -1074,14 +1048,11 @@ class FilesCog(commands.Cog, name="文件"):
         log_embed.add_field(
             name="累计下载", value=f"{record['download_count'] + 1} 次", inline=True
         )
-        if traced:
-            log_embed.add_field(name="溯源标记", value="🔖 已注入", inline=True)
         await self.bot.send_log(interaction.guild, log_embed)
 
         try:
-            note = "此下载已记录，文件内嵌溯源标记" if traced else "此下载已记录"
             await interaction.followup.send(
-                f"📦 `{record['name']}`（{note}）",
+                f"📦 `{record['name']}`（此下载已记录）",
                 file=discord.File(io.BytesIO(data), filename=record["name"]),
                 ephemeral=True,
             )
@@ -1156,7 +1127,7 @@ class FilesCog(commands.Cog, name="文件"):
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ────────────────────────── 详情 / 溯源 ──────────────────────────
+    # ────────────────────────── 详情 / 历史 ──────────────────────────
 
     @app_commands.command(name="fileinfo", description="查看文件详细信息")
     @app_commands.describe(file_id="文件编号或文件 ID")
@@ -1188,16 +1159,11 @@ class FilesCog(commands.Cog, name="文件"):
             value="🔒 下载需要密码" if record["password"] else "无",
             inline=True,
         )
-        embed.add_field(
-            name="溯源标记",
-            value="🔖 开启" if record["trace_enabled"] else "关闭",
-            inline=True,
-        )
         if record["description"]:
             embed.add_field(name="描述", value=record["description"], inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="history", description="查看文件的下载溯源记录（上传者或管理员可用）")
+    @app_commands.command(name="history", description="查看文件的下载记录（上传者或管理员可用）")
     @app_commands.describe(file_id="文件编号或文件 ID")
     async def history(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None and isinstance(
@@ -1219,7 +1185,7 @@ class FilesCog(commands.Cog, name="文件"):
         rows = await self.bot.db.get_download_history(record["file_id"])
         no = f"#{record['seq']} · " if record["seq"] else ""
         embed = discord.Embed(
-            title=f"🕵️ 下载溯源：{no}{record['name']}",
+            title=f"🕵️ 下载记录：{no}{record['name']}",
             color=discord.Color.gold(),
         )
         embed.set_footer(text=f"累计下载 {record['download_count']} 次，最多显示最近 20 条")
@@ -1281,6 +1247,7 @@ class FilesCog(commands.Cog, name="文件"):
         ]
         mention = " ".join(r.mention for r in admin_roles[:10]) or "@here"
 
+        vote_cfg = await self.bot.db.get_vote_config(interaction.guild.id)
         view = AppealVoteView(
             self.bot,
             interaction.guild.id,
@@ -1288,6 +1255,7 @@ class FilesCog(commands.Cog, name="文件"):
             ban["reason"],
             ban["banned_until"],
             (reason or "").strip(),
+            required=vote_cfg["appeal"],
         )
         try:
             msg = await channel.send(
