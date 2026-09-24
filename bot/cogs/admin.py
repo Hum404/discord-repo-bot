@@ -26,6 +26,10 @@ DEFAULT_ORGANIZE_VOTES_GUILD = 3
 DEFAULT_RESET_VOTES_REQUIRED = 3
 
 
+class OrganizeCancelled(Exception):
+    """整理/初始化任务被 /organize_cancel 手动取消。"""
+
+
 class OrganizeVoteView(discord.ui.View):
     """整理投票：集齐所需数量的管理员同意后自动执行整理。"""
 
@@ -191,6 +195,8 @@ class OrganizeConfirmView(discord.ui.View):
         self.channels: set[int] = {
             cid for cid in (filter_channels or set()) if cid in sweep_plan
         }
+        # 是否登记散落文件（成员直接发到频道、未入库的文件）；关闭后仅迁移错位文件
+        self.sweep = True
         self.message: discord.Message | None = None
 
         mode_select = discord.ui.Select(
@@ -260,6 +266,11 @@ class OrganizeConfirmView(discord.ui.View):
             else "✅ 白名单：只整理【所选】的频道"
         )
         desc += f"🛡️ 名单模式：{mode_text}\n"
+        desc += (
+            "🧹 散落文件登记：开启（范围内未登记的文件消息会入库并归拢）\n"
+            if self.sweep
+            else "🧹 散落文件登记：**关闭**（只迁移错位的已登记文件，不扫描频道）\n"
+        )
         total = 0
         lines = []
         for cid, count in sorted(self.sweep_plan.items(), key=lambda kv: -kv[1]):
@@ -270,7 +281,11 @@ class OrganizeConfirmView(discord.ui.View):
                 total += count
             else:
                 lines.append(f"~~{name}~~ {count} 个（跳过）")
-        if lines:
+        if not self.sweep:
+            total_all = sum(self.sweep_plan.values())
+            if total_all:
+                desc += f"🧹 范围内有 {total_all} 个散落文件，本次**不会登记**\n"
+        elif lines:
             shown = "\n".join(lines[:15])
             if len(lines) > 15:
                 shown += f"\n… 共 {len(lines)} 个频道"
@@ -304,6 +319,12 @@ class OrganizeConfirmView(discord.ui.View):
         self.stop()
         await self._run(saved=save)
 
+    @discord.ui.button(label="散落文件登记：开", emoji="🧹", style=discord.ButtonStyle.secondary)
+    async def toggle_sweep(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.sweep = not self.sweep
+        button.label = f"散落文件登记：{'开' if self.sweep else '关'}"
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
     @discord.ui.button(label="确认开始整理", emoji="✅", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._start(interaction, save=False)
@@ -326,6 +347,7 @@ class OrganizeConfirmView(discord.ui.View):
         self.stop()
 
     async def _run(self, *, saved: bool) -> None:
+        self.cog._organize_cancel.discard(self.guild.id)  # 清掉可能残留的取消标记
         self.cog._organizing.add(self.guild.id)
         try:
             # 白名单 = 只扫描所选；黑名单 = 扫描所选以外
@@ -338,6 +360,7 @@ class OrganizeConfirmView(discord.ui.View):
             stats = await self.cog.run_organize(
                 self.guild, self.channel_ids, self.scan_channel_ids, self.message,
                 exclude_channel_ids=exclude, include_channel_ids=include,
+                sweep_loose=self.sweep,
             )
             mode_text = "白名单" if self.mode == "white" else "黑名单"
             desc = (
@@ -358,13 +381,29 @@ class OrganizeConfirmView(discord.ui.View):
             )
             if stats["failed"]:
                 desc += f"\n⚠️ 失败 {stats['failed']} 个（详情见运行日志 logs/bot.log）"
-            if self.message:
-                await self.message.edit(
+            if self.message:                await self.message.edit(
                     embed=discord.Embed(
                         title="🗂️ 整理完成", description=desc, color=discord.Color.green()
                     ),
                     view=None,
                 )
+        except OrganizeCancelled:
+            await self.cog.bot.log_admin(
+                self.guild, self.initiator,
+                f"⏹️ 整理被手动取消（{self.scope_label}）",
+            )
+            if self.message:
+                try:
+                    await self.message.edit(
+                        embed=discord.Embed(
+                            title="⏹️ 整理已取消",
+                            description="任务被 /organize_cancel 手动取消，已处理的部分不回滚。",
+                            color=discord.Color.light_grey(),
+                        ),
+                        view=None,
+                    )
+                except discord.HTTPException:
+                    pass
         except Exception as exc:
             log.exception("整理执行失败")
             if self.message:
@@ -379,6 +418,7 @@ class OrganizeConfirmView(discord.ui.View):
                     pass
         finally:
             self.cog._organizing.discard(self.guild.id)
+            self.cog._organize_cancel.discard(self.guild.id)
 
     async def on_timeout(self) -> None:
         if self.message:
@@ -556,6 +596,10 @@ class VoteConfigModal(discord.ui.Modal, title="🗳️ 投票人数设置"):
         super().__init__()
         self.view = view
         cfg = view.cfg
+        self.organize_channel = discord.ui.TextInput(
+            label="一键整理·当前频道（默认 1）", default=str(cfg["organize_channel"]),
+            min_length=1, max_length=2,
+        )
         self.organize_category = discord.ui.TextInput(
             label="一键整理·当前子区（默认 2）", default=str(cfg["organize_category"]),
             min_length=1, max_length=2,
@@ -572,12 +616,16 @@ class VoteConfigModal(discord.ui.Modal, title="🗳️ 投票人数设置"):
             label="申诉工单·解封/驳回各需（默认 2）", default=str(cfg["appeal"]),
             min_length=1, max_length=2,
         )
-        for item in (self.organize_category, self.organize_guild, self.reset, self.appeal):
+        for item in (
+            self.organize_channel, self.organize_category,
+            self.organize_guild, self.reset, self.appeal,
+        ):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
             values = {
+                "organize_channel": int(self.organize_channel.value),
                 "organize_category": int(self.organize_category.value),
                 "organize_guild": int(self.organize_guild.value),
                 "reset": int(self.reset.value),
@@ -598,6 +646,7 @@ class VoteConfigModal(discord.ui.Modal, title="🗳️ 投票人数设置"):
         await self.view.cog.bot.log_admin(
             interaction.guild, interaction.user,
             "🗳️ 修改投票人数："
+            f"整理·频道 {values['organize_channel']} 票 · "
             f"整理·子区 {values['organize_category']} 票 · "
             f"整理·全服 {values['organize_guild']} 票 · "
             f"初始化 {values['reset']} 票 · 申诉 {values['appeal']} 票",
@@ -619,6 +668,7 @@ class VoteConfigView(discord.ui.View):
             description=(
                 "以下投票均由管理员点击按钮计数，**发起者自动计 1 票**，\n"
                 "集齐所需人数即通过（范围 1~20，仅本服务器生效）：\n\n"
+                f"🗂️ 一键整理·当前频道：**{cfg['organize_channel']}** 票\n"
                 f"🗂️ 一键整理·当前子区：**{cfg['organize_category']}** 票\n"
                 f"🗂️ 一键整理·整个服务器：**{cfg['organize_guild']}** 票\n"
                 f"⚠️ 初始化服务器 /reset_server：**{cfg['reset']}** 票\n"
@@ -737,6 +787,7 @@ class ResetVoteView(discord.ui.View):
                 pass
 
     async def _run(self) -> None:
+        self.cog._organize_cancel.discard(self.guild.id)  # 清掉可能残留的取消标记
         self.cog._organizing.add(self.guild.id)  # 复用执行锁，避免与整理并发
         try:
             stats = await self.cog.run_reset(self.guild, self.delete_files)
@@ -772,12 +823,15 @@ class ResetVoteView(discord.ui.View):
                     pass
         finally:
             self.cog._organizing.discard(self.guild.id)
+            self.cog._organize_cancel.discard(self.guild.id)
 
 
 class AdminCog(commands.Cog, name="管理"):
     def __init__(self, bot: RepoBot):
         self.bot = bot
         self._organizing: set[int] = set()
+        # 已收到 /organize_cancel 取消请求的服务器（run_organize 在循环中检查）
+        self._organize_cancel: set[int] = set()
 
     # ───────────────────── 存储模式 ─────────────────────
 
@@ -1009,6 +1063,7 @@ class AdminCog(commands.Cog, name="管理"):
     @app_commands.describe(scope="整理范围")
     @app_commands.choices(
         scope=[
+            app_commands.Choice(name="当前频道", value="channel"),
             app_commands.Choice(name="当前子区", value="category"),
             app_commands.Choice(name="整个服务器", value="guild"),
         ]
@@ -1019,12 +1074,34 @@ class AdminCog(commands.Cog, name="管理"):
         guild = interaction.guild
         if guild.id in self._organizing:
             await interaction.response.send_message(
-                "❌ 当前已有整理任务在执行，请等待其完成。", ephemeral=True
+                "❌ 当前已有整理任务在执行，请等待其完成。\n"
+                "如确认任务卡死，可用 `/organize_cancel` 强制取消。", ephemeral=True
             )
             return
         vote_cfg = await self.bot.db.get_vote_config(guild.id)
 
-        if scope.value == "category":
+        if scope.value == "channel":
+            ch = interaction.channel
+            if not isinstance(ch, discord.TextChannel):
+                await interaction.response.send_message(
+                    "❌ 请在目标文字频道中使用「当前频道」范围。", ephemeral=True
+                )
+                return
+            settings = await self.bot.db.get_settings(guild.id)
+            channel_ids = {ch.id}
+            if settings and settings["storage_mode"] == "guild" and settings["storage_guild_id"]:
+                # 独立存储服务器模式：已登记文件在存储服务器，按同名频道匹配迁移范围
+                storage_guild = self.bot.get_guild(settings["storage_guild_id"])
+                target = (
+                    discord.utils.get(storage_guild.text_channels, name=ch.name)
+                    if storage_guild
+                    else None
+                )
+                channel_ids = {target.id} if target else set()
+            scan_channel_ids = {ch.id}
+            required = vote_cfg["organize_channel"]
+            scope_label = f"当前频道 #{ch.name}"
+        elif scope.value == "category":
             business_cat = (
                 interaction.channel.category
                 if isinstance(interaction.channel, discord.TextChannel)
@@ -1120,10 +1197,47 @@ class AdminCog(commands.Cog, name="管理"):
             sweep_plan=sweep_plan, misplaced=misplaced,
             filter_mode=filter_mode, filter_ids=filter_ids,
         )
+        if len(view.voters) >= view.required:
+            # 所需票数为 1：发起者自动计票即达标，直接进入范围确认
+            view.stop()
+            confirm = OrganizeConfirmView(
+                self, guild, scope_label, channel_ids, scan_channel_ids,
+                sweep_plan, misplaced, interaction.user,
+                filter_mode=filter_mode, filter_channels=filter_ids,
+            )
+            await progress.edit(content=None, embed=confirm.make_embed(), view=confirm)
+            confirm.message = progress
+            await self.bot.log_admin(
+                guild, interaction.user,
+                f"🗳️ 整理投票（{scope_label}）所需 1 票，发起者自动通过，等待确认范围",
+            )
+            return
         await progress.edit(content=None, embed=view.make_embed("🗂️ 整理投票"), view=view)
         view.message = progress
         await self.bot.log_admin(
             interaction.guild, interaction.user, f"🗳️ 发起整理投票（{scope_label}）"
+        )
+
+    @app_commands.command(
+        name="organize_cancel",
+        description="强制取消正在执行的整理/初始化任务（管理员）",
+    )
+    @admin_only
+    async def organize_cancel(self, interaction: discord.Interaction):
+        assert interaction.guild is not None
+        gid = interaction.guild.id
+        if gid not in self._organizing:
+            await interaction.response.send_message(
+                "✅ 当前没有执行中的整理/初始化任务。", ephemeral=True
+            )
+            return
+        self._organize_cancel.add(gid)
+        await interaction.response.send_message(
+            "⏹️ 已请求取消：任务会在当前文件处理完后停止（已处理的部分不回滚）。",
+            ephemeral=True,
+        )
+        await self.bot.log_admin(
+            interaction.guild, interaction.user, "⏹️ 请求取消整理/初始化任务"
         )
 
     @app_commands.command(
@@ -1312,12 +1426,17 @@ class AdminCog(commands.Cog, name="管理"):
         message: discord.Message | None,
         exclude_channel_ids: set[int] | None = None,
         include_channel_ids: set[int] | None = None,
+        sweep_loose: bool = True,
     ) -> dict:
         """整理存储文件，分两阶段：
 
         ① 迁移：已登记但不在当前存储频道的文件，搬运到存储频道并更新索引；
         ② 扫描：范围内频道里未登记的文件消息（成员直接发的），登记入库并
            搬入存储频道；本就在存储频道的单附件消息原地登记。
+           sweep_loose=False 时跳过阶段 ②（只迁移已登记文件）。
+
+        执行中可通过 /organize_cancel 取消（抛 OrganizeCancelled）；
+        存储频道被删除会立即中止（抛 RuntimeError），避免无效空跑。
 
         exclude/include_channel_ids 为确认面板决定的频道名单（阶段 1 仅套用
         exclude）：显式传入（含空集）即以面板为准，不再加载持久名单；
@@ -1349,6 +1468,12 @@ class AdminCog(commands.Cog, name="管理"):
         # ── 阶段 1：迁移已登记但不在存储频道的文件 ──
         total = len(files)
         for i, row in enumerate(files, 1):
+            if guild.id in self._organize_cancel:
+                raise OrganizeCancelled("整理被 /organize_cancel 取消")
+            if self.bot.get_channel(storage.id) is None:
+                raise RuntimeError(
+                    "存储频道在整理过程中被删除，整理已中止（已处理的部分不回滚）。"
+                )
             if channel_ids is not None and row["storage_channel_id"] not in channel_ids:
                 stats["skipped"] += 1
                 continue
@@ -1381,6 +1506,9 @@ class AdminCog(commands.Cog, name="管理"):
                 await report_progress(f"阶段 1/2 迁移已登记文件：**{i}/{total}**")
 
         # ── 阶段 2：扫描范围内频道，登记未入库的散落文件 ──
+        if not sweep_loose:
+            log.info("整理：散落文件登记已关闭，跳过阶段 2（guild=%s）", guild.id)
+            return stats
         if scan_channel_ids is None:
             scan_channels: list[discord.TextChannel] = list(guild.text_channels)
         else:
@@ -1410,6 +1538,12 @@ class AdminCog(commands.Cog, name="管理"):
         for ch in scan_channels:
             try:
                 async for msg in ch.history(limit=None, oldest_first=True):
+                    if guild.id in self._organize_cancel:
+                        raise OrganizeCancelled("整理被 /organize_cancel 取消")
+                    if self.bot.get_channel(storage.id) is None:
+                        raise RuntimeError(
+                            "存储频道在整理过程中被删除，整理已中止（已处理的部分不回滚）。"
+                        )
                     if not msg.attachments or (me is not None and msg.author.id == me.id):
                         continue
                     if (ch.id, msg.id) in tracked:
@@ -1513,7 +1647,8 @@ class AdminCog(commands.Cog, name="管理"):
         assert interaction.guild is not None and isinstance(interaction.user, discord.Member)
         if interaction.guild.id in self._organizing:
             await interaction.response.send_message(
-                "❌ 当前已有整理/初始化任务在执行，请等待其完成。", ephemeral=True
+                "❌ 当前已有整理/初始化任务在执行，请等待其完成。\n"
+                "如确认任务卡死，可用 `/organize_cancel` 强制取消。", ephemeral=True
             )
             return
         vote_cfg = await self.bot.db.get_vote_config(interaction.guild.id)
@@ -1525,6 +1660,14 @@ class AdminCog(commands.Cog, name="管理"):
             embed=view.make_embed("⚠️ 初始化投票"), view=view
         )
         view.message = await interaction.original_response()
+        if len(view.voters) >= view.required:
+            # 所需票数为 1：发起者自动计票即达标，直接执行
+            view._disable()
+            await view.message.edit(
+                embed=view.make_embed("⚠️ 投票通过，开始初始化…"), view=view
+            )
+            view.stop()
+            asyncio.create_task(view._run())
         await self.bot.log_admin(
             interaction.guild, interaction.user, f"⚠️ 发起初始化投票（{view.mode_label}）"
         )
