@@ -232,11 +232,13 @@ class DownloadPasswordModal(discord.ui.Modal, title="🔒 输入下载密码"):
         await self.cog._deliver_file(interaction, record)
 
 
-APPEAL_VOTES_REQUIRED = 2  # 解封/驳回各需的管理员票数
+APPEAL_VOTES_REQUIRED = 2  # 解封/驳回各需的管理员票数（默认值，可用 /vote_config 按服务器调整）
 
 
 class AppealVoteView(discord.ui.View):
-    """解封申诉工单：管理员投票，集齐 2 票同意即解封，2 票拒绝即驳回。
+    """解封申诉工单：管理员投票，同意/拒绝任一方先集齐所需票数即结案。
+
+    所需票数由 /vote_config 按服务器配置（默认 2 票）。
 
     按钮使用固定 custom_id，配合 cog_load 中的 add_view 恢复，
     Bot 重启后历史工单仍可继续投票（票数清零重新计）。
@@ -251,6 +253,7 @@ class AppealVoteView(discord.ui.View):
         banned_until: float,
         appeal_reason: str,
         appeal_id: int | None = None,
+        required: int = APPEAL_VOTES_REQUIRED,
     ):
         super().__init__(timeout=None)
         self.bot = bot
@@ -260,6 +263,7 @@ class AppealVoteView(discord.ui.View):
         self.banned_until = banned_until
         self.appeal_reason = appeal_reason
         self.appeal_id = appeal_id
+        self.required = required
         self.yes_voters: set[int] = set()
         self.no_voters: set[int] = set()
         self.message: discord.Message | None = None
@@ -285,8 +289,8 @@ class AppealVoteView(discord.ui.View):
 
     def _progress_text(self) -> str:
         return (
-            f"✅ 同意解封 {len(self.yes_voters)}/{APPEAL_VOTES_REQUIRED}　"
-            f"❌ 拒绝 {len(self.no_voters)}/{APPEAL_VOTES_REQUIRED}"
+            f"✅ 同意解封 {len(self.yes_voters)}/{self.required}　"
+            f"❌ 拒绝 {len(self.no_voters)}/{self.required}"
         )
 
     def _update_embed(
@@ -328,9 +332,9 @@ class AppealVoteView(discord.ui.View):
             await interaction.response.send_message("你已经投过票了。", ephemeral=True)
             return
         (self.yes_voters if approve else self.no_voters).add(uid)
-        if len(self.yes_voters) >= APPEAL_VOTES_REQUIRED:
+        if len(self.yes_voters) >= self.required:
             await self._finish(interaction, approved=True)
-        elif len(self.no_voters) >= APPEAL_VOTES_REQUIRED:
+        elif len(self.no_voters) >= self.required:
             await self._finish(interaction, approved=False)
         else:
             await interaction.response.edit_message(
@@ -341,10 +345,10 @@ class AppealVoteView(discord.ui.View):
         self._disable()
         result_text = (
             f"✅ 申诉通过，已解除限制（{interaction.user.mention} 等 "
-            f"{APPEAL_VOTES_REQUIRED} 名管理员同意）"
+            f"{self.required} 名管理员同意）"
             if approved
             else f"❌ 申诉驳回，封禁继续生效（{interaction.user.mention} 等 "
-            f"{APPEAL_VOTES_REQUIRED} 名管理员拒绝）"
+            f"{self.required} 名管理员拒绝）"
         )
         embed = self._update_embed(interaction.message, result=result_text)
         embed.color = discord.Color.green() if approved else discord.Color.red()
@@ -535,10 +539,11 @@ class FilesCog(commands.Cog, name="文件"):
             log.exception("读取未结案申诉工单失败")
             return
         for row in rows:
+            vote_cfg = await self.bot.db.get_vote_config(row["guild_id"])
             view = AppealVoteView(
                 self.bot, row["guild_id"], row["user_id"],
                 ban_reason="", banned_until=row["created_at"], appeal_reason="",
-                appeal_id=row["id"],
+                appeal_id=row["id"], required=vote_cfg["appeal"],
             )
             self.bot.add_view(view, message_id=row["message_id"])
         if rows:
@@ -1046,9 +1051,8 @@ class FilesCog(commands.Cog, name="文件"):
         await self.bot.send_log(interaction.guild, log_embed)
 
         try:
-            note = "此下载已记录"
             await interaction.followup.send(
-                f"📦 `{record['name']}`（{note}）",
+                f"📦 `{record['name']}`（此下载已记录）",
                 file=discord.File(io.BytesIO(data), filename=record["name"]),
                 ephemeral=True,
             )
@@ -1243,6 +1247,7 @@ class FilesCog(commands.Cog, name="文件"):
         ]
         mention = " ".join(r.mention for r in admin_roles[:10]) or "@here"
 
+        vote_cfg = await self.bot.db.get_vote_config(interaction.guild.id)
         view = AppealVoteView(
             self.bot,
             interaction.guild.id,
@@ -1250,6 +1255,7 @@ class FilesCog(commands.Cog, name="文件"):
             ban["reason"],
             ban["banned_until"],
             (reason or "").strip(),
+            required=vote_cfg["appeal"],
         )
         try:
             msg = await channel.send(
