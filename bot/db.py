@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS settings (
     risk_action_mode     TEXT NOT NULL DEFAULT 'auto',   -- 触发处置：'auto' 自动封禁 | 'review' 通知管理员
     risk_review_minutes  INTEGER NOT NULL DEFAULT 30,    -- 通知模式下管理员处理时限（分钟），超时自动封禁
     ticket_channel_id    INTEGER,                        -- 申诉工单发送频道
+    vote_organize_channel  INTEGER NOT NULL DEFAULT 1,   -- /organize 当前频道所需管理员同意人数
     vote_organize_category INTEGER NOT NULL DEFAULT 2,   -- /organize 当前子区所需管理员同意人数
     vote_organize_guild    INTEGER NOT NULL DEFAULT 3,   -- /organize 整个服务器所需管理员同意人数
     vote_reset             INTEGER NOT NULL DEFAULT 3,   -- /reset_server 所需管理员同意人数
@@ -150,6 +151,7 @@ class Database:
             "ALTER TABLE settings ADD COLUMN risk_review_minutes INTEGER NOT NULL DEFAULT 30",
             "ALTER TABLE settings ADD COLUMN ticket_channel_id INTEGER",
             "ALTER TABLE settings ADD COLUMN vote_organize_category INTEGER NOT NULL DEFAULT 2",
+            "ALTER TABLE settings ADD COLUMN vote_organize_channel INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE settings ADD COLUMN vote_organize_guild INTEGER NOT NULL DEFAULT 3",
             "ALTER TABLE settings ADD COLUMN vote_reset INTEGER NOT NULL DEFAULT 3",
             "ALTER TABLE settings ADD COLUMN vote_appeal INTEGER NOT NULL DEFAULT 2",
@@ -250,6 +252,7 @@ class Database:
 
     # 各类管理员投票所需同意人数的默认值与取值范围（1~20）
     VOTE_DEFAULTS = {
+        "organize_channel": 1,   # /organize 当前频道
         "organize_category": 2,  # /organize 当前子区
         "organize_guild": 3,     # /organize 整个服务器
         "reset": 3,              # /reset_server
