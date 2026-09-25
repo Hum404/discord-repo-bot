@@ -258,8 +258,7 @@ discord-repo-bot/
 - 🐛 修复附件读取/存储频道操作仅捕获 `HTTPException` 的问题：Discord CDN 网络异常
   （超时、连接重置）时异常未被捕获，导致指令永久卡在「正在响应」。现统一增加
   超时控制与全类型异常捕获，失败时明确提示
-- 📝 新增 [服务条款](TERMS_OF_SERVICE.md) 与 [隐私政策](PRIVACY_POLICY.md)，
-  可复制其 URL 配置到 Discord 开发者后台的 Bot 简介
+- 📝 新增 [服务条款](TERMS_OF_SERVICE.md) 与 [隐私政策](PRIVACY_POLICY.md)
 
 ### v1.5.1
 
