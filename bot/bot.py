@@ -16,6 +16,70 @@ log = logging.getLogger("repo-bot")
 STORAGE_CATEGORY_NAME = "📁 文件仓库"
 STORAGE_CHANNEL_NAME = "repository-storage"
 
+# 服务条款 / 隐私政策版本：内容实质性变更时递增，用户需重新同意
+TOS_VERSION = "2026-09-25"
+
+
+class TosConsentView(discord.ui.View):
+    """首次使用时的服务条款与隐私政策同意提示（ephemeral，随用随发）。"""
+
+    def __init__(self, bot: "RepoBot", user: discord.User | discord.Member):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.user = user
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("❌ 请由本人操作。", ephemeral=True)
+            return False
+        return True
+
+    def _disable(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="同意并继续", emoji="✅", style=discord.ButtonStyle.success)
+    async def agree(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await self.bot.db.add_consent(
+                interaction.guild.id, interaction.user.id, TOS_VERSION
+            )
+        except Exception:
+            log.exception("写入条款同意记录失败")
+            await interaction.response.send_message(
+                "❌ 记录失败，请重试。", ephemeral=True
+            )
+            return
+        self._disable()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✅ 已同意服务条款与隐私政策",
+                description="现在可以正常使用本 Bot 的全部功能了。",
+                color=discord.Color.green(),
+            ),
+            view=self,
+        )
+        self.stop()
+        await self.bot.log_admin(
+            interaction.guild, interaction.user, "📜 已同意服务条款与隐私政策"
+        )
+
+    @discord.ui.button(label="不同意", emoji="❌", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="❌ 你已拒绝服务条款与隐私政策",
+                description=(
+                    "在同意之前无法使用本 Bot 的功能。"
+                    "之后可随时执行任意指令或 `/terms` 重新查看并同意。"
+                ),
+                color=discord.Color.red(),
+            ),
+            view=self,
+        )
+        self.stop()
+
 
 class RepoBot(commands.Bot):
     def __init__(self, config: Config):
@@ -27,8 +91,54 @@ class RepoBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.db.connect()
         self.tree.on_error = self._on_app_command_error
+        self.tree.interaction_check = self._tos_gate
         await self.load_extension("bot.cogs.files")
         await self.load_extension("bot.cogs.admin")
+
+    def build_tos_embed(self) -> discord.Embed:
+        """服务条款与隐私政策的同意提示嵌入（同意门与 /terms 共用）。"""
+        desc = (
+            "在使用本 Bot 前，请先阅读并同意服务条款与隐私政策：\n\n"
+            "• **服务条款**：文件上传 / 下载规范、下载审计、密码机制、风控与违规处置\n"
+            "• **隐私政策**：收集的数据（用户 ID、用户名、上传 / 下载记录等）及其用途与保存方式\n"
+        )
+        links = []
+        if self.config.tos_url:
+            links.append(f"[📜 服务条款全文]({self.config.tos_url})")
+        if self.config.privacy_url:
+            links.append(f"[🔒 隐私政策全文]({self.config.privacy_url})")
+        if links:
+            desc += "\n" + "　".join(links) + "\n"
+        desc += (
+            "\n点击「✅ 同意并继续」即表示你已阅读并同意上述条款（之后不再提示）；\n"
+            "点击「❌ 不同意」则无法使用本 Bot 的功能。"
+        )
+        return discord.Embed(
+            title="📜 服务条款与隐私政策",
+            description=desc,
+            color=discord.Color.blurple(),
+        )
+
+    async def _tos_gate(self, interaction: discord.Interaction) -> bool:
+        """全局指令检查：首次使用须先同意服务条款与隐私政策，不同意则无法使用。"""
+        if interaction.guild is None:
+            return True
+        command = interaction.command
+        if command is not None and command.name == "terms":
+            return True  # 查看条款本身不需要先同意
+        try:
+            if await self.db.has_consent(
+                interaction.guild.id, interaction.user.id, TOS_VERSION
+            ):
+                return True
+        except Exception:
+            log.exception("读取条款同意记录失败")
+            return True  # 数据库异常不阻断正常使用
+        view = TosConsentView(self, interaction.user)
+        await interaction.response.send_message(
+            embed=self.build_tos_embed(), view=view, ephemeral=True
+        )
+        return False
 
     async def _on_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError

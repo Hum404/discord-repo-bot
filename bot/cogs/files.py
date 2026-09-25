@@ -12,7 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from ..bot import RepoBot, fmt_size
+from ..bot import RepoBot, TosConsentView, fmt_size
 
 log = logging.getLogger("repo-bot")
 
@@ -48,12 +48,14 @@ def build_storage_embed(
     uploader: discord.User | discord.Member,
     description: str = "",
     has_password: bool = False,
+    author_note: str | None = None,
+    pending: bool = False,
 ) -> discord.Embed:
     """存储频道中的文件入库卡片。"""
     embed = discord.Embed(
-        title="📦 文件入库",
+        title="📦 文件入库（待审核）" if pending else "📦 文件入库",
         description=description or discord.utils.escape_markdown(name),
-        color=discord.Color.blurple(),
+        color=discord.Color.orange() if pending else discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="文件名", value=name, inline=False)
@@ -63,6 +65,8 @@ def build_storage_embed(
     )
     if has_password:
         embed.add_field(name="密码保护", value="🔒 下载需要密码", inline=True)
+    if author_note:
+        embed.add_field(name="📝 作者的话", value=author_note[:1024], inline=False)
     embed.set_footer(text="文件 ID 见入库回执")
     return embed
 
@@ -116,8 +120,31 @@ class RenameFileModal(discord.ui.Modal, title="✏️ 重命名文件"):
         )
 
 
+class AuthorNoteModal(discord.ui.Modal, title="📝 作者的话 / 免责声明"):
+    """上传准备阶段：填写随文件展示的作者的话或免责声明。"""
+
+    note = discord.ui.TextInput(
+        label="作者的话（随文件展示，可选）",
+        placeholder="例如：转载请注明作者 / 禁止商用 / 素材来源说明…",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000,
+    )
+
+    def __init__(self, view: "UploadPrepView"):
+        super().__init__()
+        self._view = view
+        self.note.default = view.author_note or None
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self._view.author_note = str(self.note.value or "").strip()
+        await interaction.response.edit_message(
+            embed=self._view.make_embed(), view=self._view
+        )
+
+
 class UploadPrepView(discord.ui.View):
-    """上传准备页：设置密码 / 重命名 / 确认上传 / 取消。"""
+    """上传准备页：设置密码 / 重命名 / 作者的话 / 确认上传 / 取消。"""
 
     def __init__(
         self,
@@ -138,6 +165,7 @@ class UploadPrepView(discord.ui.View):
         self.original_name = attachment.filename
         self.name = attachment.filename
         self.password: str | None = None
+        self.author_note = ""
         self._finished = False
 
     def make_embed(self) -> discord.Embed:
@@ -145,9 +173,10 @@ class UploadPrepView(discord.ui.View):
         if self.name != self.original_name:
             desc += f"✏️ 原名：`{self.original_name}`\n"
         desc += f"🔒 下载密码：{'已设置 ✅' if self.password else '未设置'}\n"
+        desc += f"📝 作者的话：{'已填写 ✅' if self.author_note else '未填写'}\n"
         if self.description:
             desc += f"📝 描述：{self.description}\n"
-        desc += "\n可点击「设置密码」「重命名」调整，确认无误后点击「确认上传」。"
+        desc += "\n可点击「设置密码」「重命名」「作者的话」调整，确认无误后点击「确认上传」。"
         return discord.Embed(
             title="📤 上传准备", description=desc, color=discord.Color.blurple()
         )
@@ -171,6 +200,10 @@ class UploadPrepView(discord.ui.View):
     @discord.ui.button(label="重命名", emoji="✏️", style=discord.ButtonStyle.secondary)
     async def rename(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RenameFileModal(self))
+
+    @discord.ui.button(label="作者的话", emoji="📝", style=discord.ButtonStyle.secondary)
+    async def edit_note(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AuthorNoteModal(self))
 
     @discord.ui.button(label="确认上传", emoji="✅", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -527,6 +560,176 @@ class RiskReviewView(discord.ui.View):
         await self.bot.log_admin(interaction.guild, interaction.user, log_text)
 
 
+class RejectReasonModal(discord.ui.Modal, title="❌ 拒绝发布"):
+    """审核拒绝：可选填写原因，将私信告知上传者。"""
+
+    reason = discord.ui.TextInput(
+        label="拒绝原因（会私信告知上传者，可留空）",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=300,
+    )
+
+    def __init__(self, view: "PublishReviewView"):
+        super().__init__()
+        self._view = view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self._view.reject(interaction, str(self.reason.value or "").strip())
+
+
+class PublishReviewView(discord.ui.View):
+    """发布审核工单：通过发布 / 拒绝（固定 custom_id，重启后可恢复）。"""
+
+    def __init__(self, bot: RepoBot, file_id: str):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.file_id = file_id
+
+    @staticmethod
+    def _is_admin(interaction: discord.Interaction) -> bool:
+        return isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator
+
+    async def _load_pending(self, interaction: discord.Interaction):
+        record = await self.bot.db.get_file(self.file_id)
+        if record is None:
+            await interaction.response.send_message(
+                "❌ 文件记录不存在（可能已被处理）。", ephemeral=True
+            )
+            return None
+        if record["status"] != "pending":
+            await interaction.response.send_message("ℹ️ 该文件已处理过。", ephemeral=True)
+            return None
+        return record
+
+    def _settle_embed(self, interaction, title, color, field_name=None, field_value=None):
+        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        embed.title = title
+        embed.color = color
+        if field_name and field_value:
+            embed.add_field(name=field_name, value=field_value, inline=False)
+        embed.set_footer(text=f"由 {interaction.user} 处理")
+        for child in self.children:
+            child.disabled = True
+        return embed
+
+    @discord.ui.button(
+        label="通过发布", emoji="✅", style=discord.ButtonStyle.success,
+        custom_id="pubreview:approve",
+    )
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._is_admin(interaction):
+            await interaction.response.send_message("❌ 只有管理员可以审核。", ephemeral=True)
+            return
+        record = await self._load_pending(interaction)
+        if record is None:
+            return
+        await self.bot.db.set_file_status(self.file_id, "approved")
+        # 存储卡片恢复常态标题
+        try:
+            ch = self.bot.get_channel(record["storage_channel_id"])
+            if isinstance(ch, discord.TextChannel):
+                storage_msg = await ch.fetch_message(record["storage_message_id"])
+                if storage_msg.embeds:
+                    card = storage_msg.embeds[0]
+                    card.title = "📦 文件入库"
+                    card.color = discord.Color.blurple()
+                    await storage_msg.edit(embed=card)
+        except discord.HTTPException:
+            pass
+        await interaction.response.edit_message(
+            embed=self._settle_embed(interaction, "✅ 审核通过，已发布", discord.Color.green()),
+            view=self,
+        )
+        self.stop()
+        try:
+            user = await self.bot.fetch_user(record["uploader_id"])
+            await user.send(
+                f"✅ 你在 **{interaction.guild.name}** 上传的文件 `{record['name']}` 已通过审核并发布。"
+            )
+        except discord.HTTPException:
+            pass
+        # 正式发布审计日志
+        log_embed = discord.Embed(
+            title="📤 上传记录", color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        log_embed.add_field(
+            name="文件", value=f"`{record['file_id']}` · {record['name']}", inline=False
+        )
+        log_embed.add_field(
+            name="上传者",
+            value=f"<@{record['uploader_id']}> (`{record['uploader_id']}`)",
+            inline=True,
+        )
+        log_embed.add_field(name="大小", value=fmt_size(record["size"]), inline=True)
+        if record["password"]:
+            log_embed.add_field(name="密码保护", value="🔒 是", inline=True)
+        if record["author_note"]:
+            log_embed.add_field(name="作者的话", value=record["author_note"][:1024], inline=False)
+        await self.bot.send_log(interaction.guild, log_embed)
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            f"✅ 审核通过发布：`{record['name']}`（编号 `#{record['seq']}`，"
+            f"上传者 <@{record['uploader_id']}>）",
+        )
+
+    @discord.ui.button(
+        label="拒绝", emoji="❌", style=discord.ButtonStyle.danger,
+        custom_id="pubreview:reject",
+    )
+    async def reject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._is_admin(interaction):
+            await interaction.response.send_message("❌ 只有管理员可以审核。", ephemeral=True)
+            return
+        record = await self.bot.db.get_file(self.file_id)
+        if record is None or record["status"] != "pending":
+            await interaction.response.send_message("ℹ️ 该文件已处理过。", ephemeral=True)
+            return
+        await interaction.response.send_modal(RejectReasonModal(self))
+
+    async def reject(self, interaction: discord.Interaction, reason: str) -> None:
+        """拒绝：删除存储消息与数据库记录，私信通知上传者。"""
+        record = await self.bot.db.get_file(self.file_id)
+        if record is None:
+            await interaction.response.send_message("❌ 文件记录不存在。", ephemeral=True)
+            return
+        try:
+            ch = self.bot.get_channel(record["storage_channel_id"])
+            if isinstance(ch, discord.TextChannel):
+                storage_msg = await ch.fetch_message(record["storage_message_id"])
+                await storage_msg.delete()
+        except discord.HTTPException:
+            pass
+        await self.bot.db.delete_file(self.file_id)
+        await interaction.response.edit_message(
+            embed=self._settle_embed(
+                interaction, "❌ 审核未通过，已移除", discord.Color.red(),
+                field_name="拒绝原因" if reason else None, field_value=reason[:300],
+            ),
+            view=self,
+        )
+        self.stop()
+        try:
+            user = await self.bot.fetch_user(record["uploader_id"])
+            text = (
+                f"❌ 你在 **{interaction.guild.name}** 上传的文件 `{record['name']}` "
+                "未通过审核，已从仓库移除。"
+            )
+            if reason:
+                text += f"\n原因：{reason}"
+            await user.send(text)
+        except discord.HTTPException:
+            pass
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            f"❌ 审核拒绝并移除：`{record['name']}`（上传者 <@{record['uploader_id']}>）"
+            + (f"，原因：{reason}" if reason else ""),
+        )
+
+
 class FilesCog(commands.Cog, name="文件"):
     def __init__(self, bot: RepoBot):
         self.bot = bot
@@ -563,6 +766,19 @@ class FilesCog(commands.Cog, name="文件"):
                 self.bot.add_view(view, message_id=row["message_id"])
         if pending:
             log.info("已恢复 %d 个待处理风控工单的处理按钮", len(pending))
+        # 恢复发布审核工单的按钮（Bot 重启后仍可审核）
+        try:
+            pending_files = await self.bot.db.list_pending_reviews()
+        except Exception:
+            log.exception("读取待审核文件失败")
+            pending_files = []
+        for row in pending_files:
+            self.bot.add_view(
+                PublishReviewView(self.bot, row["file_id"]),
+                message_id=row["review_message_id"],
+            )
+        if pending_files:
+            log.info("已恢复 %d 个发布审核工单的按钮", len(pending_files))
         self._review_sweeper.start()
 
     async def cog_unload(self) -> None:
@@ -797,7 +1013,10 @@ class FilesCog(commands.Cog, name="文件"):
             row = await self.bot.db.get_file_by_seq(guild_id, int(digits))
             if row is not None:
                 return row
-        return await self.bot.db.get_file(s.lower())
+        row = await self.bot.db.get_file(s.lower())
+        if row is not None and row["status"] != "approved":
+            return None  # 待审核文件不可见、不可下载
+        return row
 
     # ────────────────────────── 上传 ──────────────────────────
 
@@ -851,8 +1070,22 @@ class FilesCog(commands.Cog, name="文件"):
             return
 
         uploader = prep.uploader
+        # ── 发布审核判定：开启审核 + 审核频道有效 + 上传者非管理员 → 待审核，不直接发布 ──
+        settings = await self.bot.db.get_settings(guild.id)
+        review_ch = (
+            guild.get_channel(settings["review_channel_id"])
+            if settings and settings["review_enabled"] and settings["review_channel_id"]
+            else None
+        )
+        is_admin = (
+            isinstance(uploader, discord.Member)
+            and uploader.guild_permissions.administrator
+        )
+        needs_review = isinstance(review_ch, discord.TextChannel) and not is_admin
+
         embed = build_storage_embed(
-            prep.name, len(prep.data), uploader, prep.description, prep.password is not None
+            prep.name, len(prep.data), uploader, prep.description, prep.password is not None,
+            author_note=prep.author_note, pending=needs_review,
         )
         try:
             storage_msg = await storage.send(
@@ -901,6 +1134,8 @@ class FilesCog(commands.Cog, name="文件"):
             storage_channel_id=storage.id,
             storage_message_id=storage_msg.id,
             password=prep.password,
+            status="pending" if needs_review else "approved",
+            author_note=prep.author_note or None,
         )
 
         # 回写文件 ID 到存储消息的 embed，方便管理员对照
@@ -909,6 +1144,13 @@ class FilesCog(commands.Cog, name="文件"):
             await storage_msg.edit(embed=embed)
         except discord.HTTPException:
             pass
+
+        # ── 待审核：发审核工单，不进入公开列表 / 不发审计日志（通过后补发） ──
+        if needs_review:
+            await self._submit_review(
+                interaction, prep, file_id, seq, storage_msg, review_ch
+            )
+            return
 
         log_embed = discord.Embed(
             title="📤 上传记录",
@@ -922,6 +1164,8 @@ class FilesCog(commands.Cog, name="文件"):
         log_embed.add_field(name="大小", value=fmt_size(len(prep.data)), inline=True)
         if prep.password:
             log_embed.add_field(name="密码保护", value="🔒 是", inline=True)
+        if prep.author_note:
+            log_embed.add_field(name="作者的话", value=prep.author_note[:1024], inline=False)
         await self.bot.send_log(guild, log_embed)
 
         # 管理日志：上传时重命名同步记录
@@ -938,6 +1182,7 @@ class FilesCog(commands.Cog, name="文件"):
             f"🆔 文件 ID：`{file_id}`\n"
             f"💾 大小：{fmt_size(len(prep.data))}\n"
             f"🔒 下载密码：{'已设置' if prep.password else '无'}\n"
+            f"📝 作者的话：{'已填写' if prep.author_note else '无'}\n"
             f"📥 下载方式：使用 `/download {seq}` 或 `/download {file_id}`"
         )
         if prep.name != prep.original_name:
@@ -945,6 +1190,66 @@ class FilesCog(commands.Cog, name="文件"):
         await interaction.edit_original_response(
             embed=discord.Embed(
                 title="✅ 上传成功", description=desc, color=discord.Color.green()
+            ),
+            view=None,
+        )
+
+    async def _submit_review(
+        self,
+        interaction: discord.Interaction,
+        prep: UploadPrepView,
+        file_id: str,
+        seq: int,
+        storage_msg: discord.Message,
+        review_ch: discord.TextChannel,
+    ) -> None:
+        """发布审核开启时：生成审核工单，文件暂不入列（待审核）。"""
+        guild = prep.guild
+        uploader = prep.uploader
+        embed = discord.Embed(
+            title="🔍 发布审核",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="文件", value=f"`{file_id}` · {prep.name}（编号 `#{seq}`）", inline=False
+        )
+        embed.add_field(
+            name="上传者", value=f"{uploader.mention} (`{uploader.id}`)", inline=True
+        )
+        embed.add_field(name="大小", value=fmt_size(len(prep.data)), inline=True)
+        if prep.password:
+            embed.add_field(name="密码保护", value="🔒 是", inline=True)
+        if prep.author_note:
+            embed.add_field(name="📝 作者的话", value=prep.author_note[:1024], inline=False)
+        if prep.description:
+            embed.add_field(name="描述", value=prep.description[:1024], inline=False)
+        view = PublishReviewView(self.bot, file_id)
+        try:
+            msg = await review_ch.send(
+                embed=embed,
+                view=view,
+                file=discord.File(io.BytesIO(prep.data), filename=prep.name),
+            )
+        except discord.HTTPException:
+            msg = await review_ch.send(
+                content=f"📎 文件过大无法附加到工单，请到存储消息查看：{storage_msg.jump_url}",
+                embed=embed,
+                view=view,
+            )
+        await self.bot.db.set_review_message(file_id, msg.id)
+        await self.bot.log_admin(
+            guild, uploader, f"🔍 上传进入待审核：`{prep.name}`（编号 `#{seq}`）"
+        )
+        desc = (
+            f"📄 文件名：`{prep.name}`\n"
+            f"🔢 编号：`#{seq}`\n"
+            f"🆔 文件 ID：`{file_id}`\n"
+            "🔍 状态：**待审核**——管理员通过后自动发布，结果将私信通知你。"
+        )
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                title="🔍 已提交审核", description=desc, color=discord.Color.orange()
             ),
             view=None,
         )
@@ -1127,6 +1432,14 @@ class FilesCog(commands.Cog, name="文件"):
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    @app_commands.command(name="terms", description="查看服务条款与隐私政策（首次使用需同意）")
+    async def terms(self, interaction: discord.Interaction):
+        # 私信里仅可查看；同意按钮只在服务器内提供
+        view = TosConsentView(self.bot, interaction.user) if interaction.guild else None
+        await interaction.response.send_message(
+            embed=self.bot.build_tos_embed(), view=view, ephemeral=True
+        )
+
     # ────────────────────────── 详情 / 历史 ──────────────────────────
 
     @app_commands.command(name="fileinfo", description="查看文件详细信息")
@@ -1159,6 +1472,8 @@ class FilesCog(commands.Cog, name="文件"):
             value="🔒 下载需要密码" if record["password"] else "无",
             inline=True,
         )
+        if record["author_note"]:
+            embed.add_field(name="📝 作者的话", value=record["author_note"][:1024], inline=False)
         if record["description"]:
             embed.add_field(name="描述", value=record["description"], inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)

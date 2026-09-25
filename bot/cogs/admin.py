@@ -683,6 +683,89 @@ class VoteConfigView(discord.ui.View):
         await interaction.response.send_modal(VoteConfigModal(self))
 
 
+class ReviewConfigView(discord.ui.View):
+    """发布审核配置面板（/review_config）：开关 + 审核频道选择。"""
+
+    def __init__(
+        self,
+        cog: "AdminCog",
+        guild: discord.Guild,
+        enabled: bool,
+        channel_id: int | None,
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.enabled = enabled
+        self.channel_id = channel_id
+
+        current = guild.get_channel(channel_id) if channel_id else None
+        kwargs = {}
+        if isinstance(current, discord.TextChannel):
+            kwargs["default_values"] = [current]
+        select = discord.ui.ChannelSelect(
+            placeholder="选择审核频道（审核工单将发送到该频道）",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+            **kwargs,
+        )
+        select.callback = self._on_channel
+        self.add_item(select)
+
+    def make_embed(self) -> discord.Embed:
+        ch_text = f"<#{self.channel_id}>" if self.channel_id else "未设置"
+        return discord.Embed(
+            title="🔍 发布审核配置",
+            description=(
+                f"状态：**{'开启 ✅' if self.enabled else '关闭'}**\n"
+                f"审核频道：{ch_text}\n\n"
+                "开启后，**成员上传的文件先进入待审核状态**：不出现在文件列表 / 搜索 / 下载中，\n"
+                "审核工单（含文件附件与作者的话）发送到审核频道，管理员「✅ 通过」后自动发布，\n"
+                "「❌ 拒绝」则移除文件；结果均私信通知上传者并写入管理日志。\n"
+                "管理员上传始终直接发布，无需审核；关闭后所有上传直接发布。"
+            ),
+            color=discord.Color.blurple(),
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 只有管理员可以操作。", ephemeral=True)
+            return False
+        return True
+
+    async def _save(self, interaction: discord.Interaction) -> None:
+        await self.cog.bot.db.upsert_settings(
+            self.guild.id,
+            review_enabled=int(self.enabled),
+            review_channel_id=self.channel_id,
+        )
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    @discord.ui.button(label="开启 / 关闭审核", emoji="🔍", style=discord.ButtonStyle.primary)
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.enabled and not self.channel_id:
+            await interaction.response.send_message(
+                "❌ 请先在下方选择审核频道，再开启审核。", ephemeral=True
+            )
+            return
+        self.enabled = not self.enabled
+        await self._save(interaction)
+        await self.cog.bot.log_admin(
+            self.guild,
+            interaction.user,
+            f"🔍 发布审核已{'开启' if self.enabled else '关闭'}"
+            + (f"（审核频道：<#{self.channel_id}>）" if self.enabled else ""),
+        )
+
+    async def _on_channel(self, interaction: discord.Interaction) -> None:
+        self.channel_id = int(interaction.data["values"][0])
+        await self._save(interaction)
+        await self.cog.bot.log_admin(
+            self.guild, interaction.user, f"🔍 发布审核频道设置为 <#{self.channel_id}>"
+        )
+
+
 class ResetVoteView(discord.ui.View):
     """初始化投票：集齐 3 名管理员同意后执行服务器初始化。"""
 
@@ -1262,6 +1345,24 @@ class AdminCog(commands.Cog, name="管理"):
         assert interaction.guild is not None
         cfg = await self.bot.db.get_vote_config(interaction.guild.id)
         view = VoteConfigView(self, cfg)
+        await interaction.response.send_message(
+            embed=view.make_embed(), view=view, ephemeral=True
+        )
+
+    @app_commands.command(
+        name="review_config",
+        description="发布审核设置：开启后成员上传需管理员审核通过才发布（管理员）",
+    )
+    @admin_only
+    async def review_config(self, interaction: discord.Interaction):
+        assert interaction.guild is not None
+        settings = await self.bot.db.get_settings(interaction.guild.id)
+        view = ReviewConfigView(
+            self,
+            interaction.guild,
+            bool(settings and settings["review_enabled"]),
+            settings["review_channel_id"] if settings else None,
+        )
         await interaction.response.send_message(
             embed=view.make_embed(), view=view, ephemeral=True
         )
