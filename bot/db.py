@@ -36,7 +36,10 @@ CREATE TABLE IF NOT EXISTS files (
     storage_message_id INTEGER NOT NULL,
     download_count     INTEGER NOT NULL DEFAULT 0,
     password           TEXT,
-    seq                INTEGER
+    seq                INTEGER,
+    status             TEXT NOT NULL DEFAULT 'approved',  -- 'approved' 已发布 | 'pending' 待审核
+    author_note        TEXT,                              -- 作者的话 / 免责声明
+    review_message_id  INTEGER                            -- 审核工单消息 ID
 );
 
 CREATE TABLE IF NOT EXISTS downloads (
@@ -68,6 +71,8 @@ CREATE TABLE IF NOT EXISTS settings (
     risk_action_mode     TEXT NOT NULL DEFAULT 'auto',   -- 触发处置：'auto' 自动封禁 | 'review' 通知管理员
     risk_review_minutes  INTEGER NOT NULL DEFAULT 30,    -- 通知模式下管理员处理时限（分钟），超时自动封禁
     ticket_channel_id    INTEGER,                        -- 申诉工单发送频道
+    review_enabled       INTEGER NOT NULL DEFAULT 0,     -- 发布审核开关
+    review_channel_id    INTEGER,                        -- 审核频道（发布审核工单发送处）
     vote_organize_channel  INTEGER NOT NULL DEFAULT 1,   -- /organize 当前频道所需管理员同意人数
     vote_organize_category INTEGER NOT NULL DEFAULT 2,   -- /organize 当前子区所需管理员同意人数
     vote_organize_guild    INTEGER NOT NULL DEFAULT 3,   -- /organize 整个服务器所需管理员同意人数
@@ -115,6 +120,15 @@ CREATE TABLE IF NOT EXISTS risk_reviews (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_risk_reviews_pending ON risk_reviews (status, deadline);
+
+-- 服务条款与隐私政策的用户同意记录（版本变更后需重新同意）
+CREATE TABLE IF NOT EXISTS tos_consent (
+    guild_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    agreed_at INTEGER NOT NULL,
+    version   TEXT NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
 """
 
 
@@ -140,6 +154,9 @@ class Database:
         for migration in (
             "ALTER TABLE files ADD COLUMN seq INTEGER",
             "ALTER TABLE files ADD COLUMN password TEXT",
+            "ALTER TABLE files ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'",
+            "ALTER TABLE files ADD COLUMN author_note TEXT",
+            "ALTER TABLE files ADD COLUMN review_message_id INTEGER",
             "ALTER TABLE settings ADD COLUMN admin_log_channel_id INTEGER",
             "ALTER TABLE settings ADD COLUMN organize_mode TEXT NOT NULL DEFAULT 'black'",
             "ALTER TABLE settings ADD COLUMN organize_channels TEXT NOT NULL DEFAULT '[]'",
@@ -150,6 +167,8 @@ class Database:
             "ALTER TABLE settings ADD COLUMN risk_action_mode TEXT NOT NULL DEFAULT 'auto'",
             "ALTER TABLE settings ADD COLUMN risk_review_minutes INTEGER NOT NULL DEFAULT 30",
             "ALTER TABLE settings ADD COLUMN ticket_channel_id INTEGER",
+            "ALTER TABLE settings ADD COLUMN review_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE settings ADD COLUMN review_channel_id INTEGER",
             "ALTER TABLE settings ADD COLUMN vote_organize_category INTEGER NOT NULL DEFAULT 2",
             "ALTER TABLE settings ADD COLUMN vote_organize_channel INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE settings ADD COLUMN vote_organize_guild INTEGER NOT NULL DEFAULT 3",
@@ -515,6 +534,8 @@ class Database:
         storage_message_id: int,
         password: str | None = None,
         uploaded_at: int | None = None,
+        status: str = "approved",
+        author_note: str | None = None,
     ) -> tuple[str, int]:
         file_id = new_file_id()
         async with self._write_lock:
@@ -528,8 +549,9 @@ class Database:
                 INSERT INTO files (
                     file_id, origin_guild_id, name, size, content_type, description,
                     uploader_id, uploader_name, uploaded_at,
-                    storage_channel_id, storage_message_id, password, seq
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    storage_channel_id, storage_message_id, password, seq,
+                    status, author_note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     file_id,
@@ -545,6 +567,8 @@ class Database:
                     storage_message_id,
                     password,
                     seq,
+                    status,
+                    author_note,
                 ),
             )
             await self.conn.commit()
@@ -558,7 +582,8 @@ class Database:
 
     async def get_file_by_seq(self, guild_id: int, seq: int) -> aiosqlite.Row | None:
         cur = await self.conn.execute(
-            "SELECT * FROM files WHERE origin_guild_id = ? AND seq = ?", (guild_id, seq)
+            "SELECT * FROM files WHERE origin_guild_id = ? AND seq = ? AND status = 'approved'",
+            (guild_id, seq),
         )
         return await cur.fetchone()
 
@@ -567,7 +592,7 @@ class Database:
     ) -> list[aiosqlite.Row]:
         cur = await self.conn.execute(
             """
-            SELECT * FROM files WHERE origin_guild_id = ?
+            SELECT * FROM files WHERE origin_guild_id = ? AND status = 'approved'
             ORDER BY uploaded_at DESC LIMIT ? OFFSET ?
             """,
             (guild_id, limit, offset),
@@ -576,7 +601,8 @@ class Database:
 
     async def count_files(self, guild_id: int) -> int:
         cur = await self.conn.execute(
-            "SELECT COUNT(*) FROM files WHERE origin_guild_id = ?", (guild_id,)
+            "SELECT COUNT(*) FROM files WHERE origin_guild_id = ? AND status = 'approved'",
+            (guild_id,),
         )
         row = await cur.fetchone()
         return row[0] if row else 0
@@ -587,7 +613,8 @@ class Database:
         cur = await self.conn.execute(
             """
             SELECT * FROM files
-            WHERE origin_guild_id = ? AND (name LIKE ? OR description LIKE ?)
+            WHERE origin_guild_id = ? AND status = 'approved'
+              AND (name LIKE ? OR description LIKE ?)
             ORDER BY uploaded_at DESC LIMIT ?
             """,
             (guild_id, f"%{keyword}%", f"%{keyword}%", limit),
@@ -638,6 +665,46 @@ class Database:
         await self.conn.execute(
             "UPDATE files SET storage_channel_id = ?, storage_message_id = ? WHERE file_id = ?",
             (channel_id, message_id, file_id),
+        )
+        await self.conn.commit()
+
+    # ────────────────────────── 发布审核 ──────────────────────────
+
+    async def set_file_status(self, file_id: str, status: str) -> None:
+        """更新发布状态：'pending' 待审核 | 'approved' 已发布。"""
+        await self.conn.execute(
+            "UPDATE files SET status = ? WHERE file_id = ?", (status, file_id)
+        )
+        await self.conn.commit()
+
+    async def set_review_message(self, file_id: str, message_id: int) -> None:
+        await self.conn.execute(
+            "UPDATE files SET review_message_id = ? WHERE file_id = ?",
+            (message_id, file_id),
+        )
+        await self.conn.commit()
+
+    async def list_pending_reviews(self) -> list[aiosqlite.Row]:
+        """全部待审核文件（Bot 重启后恢复审核按钮用）。"""
+        cur = await self.conn.execute(
+            "SELECT * FROM files WHERE status = 'pending' AND review_message_id IS NOT NULL"
+        )
+        return await cur.fetchall()
+
+    # ────────────────────────── 服务条款同意记录 ──────────────────────────
+
+    async def has_consent(self, guild_id: int, user_id: int, version: str) -> bool:
+        cur = await self.conn.execute(
+            "SELECT 1 FROM tos_consent WHERE guild_id = ? AND user_id = ? AND version = ?",
+            (guild_id, user_id, version),
+        )
+        return await cur.fetchone() is not None
+
+    async def add_consent(self, guild_id: int, user_id: int, version: str) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO tos_consent (guild_id, user_id, agreed_at, version) "
+            "VALUES (?, ?, ?, ?)",
+            (guild_id, user_id, int(time.time()), version),
         )
         await self.conn.commit()
 

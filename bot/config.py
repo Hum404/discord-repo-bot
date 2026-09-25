@@ -25,6 +25,11 @@ class Config:
     storage_guild_id: int | None
     database_path: str
     max_file_size_mb: int
+    # 服务条款 / 隐私政策全文链接（可选，配置后同意提示中展示）
+    tos_url: str = ""
+    privacy_url: str = ""
+
+
 
 
 def load_config() -> Config:
@@ -45,4 +50,6 @@ def load_config() -> Config:
         storage_guild_id=storage_guild_id,
         database_path=database_path,
         max_file_size_mb=max_file_size_mb,
+        tos_url=os.getenv("TOS_URL", "").strip(),
+        privacy_url=os.getenv("PRIVACY_URL", "").strip(),
     )
