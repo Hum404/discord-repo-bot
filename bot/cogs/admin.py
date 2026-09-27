@@ -22,16 +22,14 @@ admin_only = app_commands.checks.has_permissions(administrator=True)
 
 
 def owner_only():
-    """仅服务器所有者（或 Bot 所有者）可用的指令检查。"""
+    """仅服务器所有者可用的指令检查（Bot 所有者也不例外）。"""
 
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
             raise app_commands.NoPrivateMessage()
         if interaction.user.id == interaction.guild.owner_id:
             return True
-        if await interaction.client.is_owner(interaction.user):
-            return True
-        raise app_commands.CheckFailure("仅服务器所有者可以使用该指令。")
+        raise app_commands.CheckFailure("只有服务器所有者可以使用该指令。")
 
     return app_commands.check(predicate)
 
@@ -816,7 +814,7 @@ class ExemptConfigView(discord.ui.View):
         ok = (
             interaction.guild is not None
             and interaction.user.id == interaction.guild.owner_id
-        ) or await self.cog.bot.is_owner(interaction.user)
+        )
         if not ok:
             await interaction.response.send_message(
                 "❌ 只有服务器所有者可以操作。", ephemeral=True

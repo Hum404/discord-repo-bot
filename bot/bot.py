@@ -178,7 +178,7 @@ class RepoBot(commands.Bot):
         elif isinstance(error, app_commands.CheckFailure):
             if interaction.response.is_done():
                 return  # 检查函数已自行回复（如风控封禁提示）
-            text = "❌ 你无法使用该指令。"
+            text = f"❌ {error}" if str(error) else "❌ 你无法使用该指令。"
         else:
             log.exception(
                 "指令 /%s 执行失败",
