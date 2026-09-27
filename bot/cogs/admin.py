@@ -20,6 +20,21 @@ log = logging.getLogger("repo-bot")
 
 admin_only = app_commands.checks.has_permissions(administrator=True)
 
+
+def owner_only():
+    """仅服务器所有者（或 Bot 所有者）可用的指令检查。"""
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise app_commands.NoPrivateMessage()
+        if interaction.user.id == interaction.guild.owner_id:
+            return True
+        if await interaction.client.is_owner(interaction.user):
+            return True
+        raise app_commands.CheckFailure("仅服务器所有者可以使用该指令。")
+
+    return app_commands.check(predicate)
+
 # 各类管理员投票的默认所需同意人数（可用 /vote_config 按服务器调整，范围 1~20）
 DEFAULT_ORGANIZE_VOTES_CATEGORY = 2
 DEFAULT_ORGANIZE_VOTES_GUILD = 3
@@ -692,12 +707,14 @@ class ReviewConfigView(discord.ui.View):
         guild: discord.Guild,
         enabled: bool,
         channel_id: int | None,
+        admin_exempt: bool = False,
     ):
         super().__init__(timeout=300)
         self.cog = cog
         self.guild = guild
         self.enabled = enabled
         self.channel_id = channel_id
+        self.admin_exempt = admin_exempt
 
         current = guild.get_channel(channel_id) if channel_id else None
         kwargs = {}
@@ -720,10 +737,12 @@ class ReviewConfigView(discord.ui.View):
             description=(
                 f"状态：**{'开启 ✅' if self.enabled else '关闭'}**\n"
                 f"审核频道：{ch_text}\n\n"
-                "开启后，**成员上传的文件先进入待审核状态**：不出现在文件列表 / 搜索 / 下载中，\n"
-                "审核工单（含文件附件与作者的话）发送到审核频道，管理员「✅ 通过」后自动发布，\n"
+                "开启后，**所有上传都先进入待审核状态**：不出现在文件列表 / 搜索 / 下载中，\n"
+                "审核工单（含文件附件与声明）发送到审核频道，管理员「✅ 通过」后自动发布，\n"
                 "「❌ 拒绝」则移除文件；结果均私信通知上传者并写入管理日志。\n"
-                "管理员上传始终直接发布，无需审核；关闭后所有上传直接发布。"
+                "关闭后所有上传直接发布。\n\n"
+                f"👑 管理员豁免：{'**开**（管理员上传直接发布）' if self.admin_exempt else '**关**（管理员上传也需审核）'}\n"
+                "（由服务器所有者通过 `/exempt_config` 调整）"
             ),
             color=discord.Color.blurple(),
         )
@@ -763,6 +782,73 @@ class ReviewConfigView(discord.ui.View):
         await self._save(interaction)
         await self.cog.bot.log_admin(
             self.guild, interaction.user, f"🔍 发布审核频道设置为 <#{self.channel_id}>"
+        )
+
+
+class ExemptConfigView(discord.ui.View):
+    """管理员豁免配置面板（/exempt_config）：仅服务器所有者可用。"""
+
+    def __init__(
+        self,
+        cog: "AdminCog",
+        guild: discord.Guild,
+        review_exempt: bool,
+        risk_exempt: bool,
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.review_exempt = review_exempt
+        self.risk_exempt = risk_exempt
+
+    def make_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title="👑 管理员豁免设置",
+            description=(
+                "以下功能可选择是否对管理员生效（仅服务器所有者可调整）：\n\n"
+                f"🔍 **发布审核对管理员**：{'豁免（管理员上传直接发布）' if self.review_exempt else '**生效**（管理员上传也需审核）'}\n"
+                f"🛡️ **下载风控对管理员**：{'**豁免**（管理员不受风控 / 封禁限制）' if self.risk_exempt else '生效（管理员也受风控限制）'}"
+            ),
+            color=discord.Color.blurple(),
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        ok = (
+            interaction.guild is not None
+            and interaction.user.id == interaction.guild.owner_id
+        ) or await self.cog.bot.is_owner(interaction.user)
+        if not ok:
+            await interaction.response.send_message(
+                "❌ 只有服务器所有者可以操作。", ephemeral=True
+            )
+        return ok
+
+    async def _save(self, interaction: discord.Interaction) -> None:
+        await self.cog.bot.db.upsert_settings(
+            self.guild.id,
+            review_admin_exempt=int(self.review_exempt),
+            risk_admin_exempt=int(self.risk_exempt),
+        )
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    @discord.ui.button(label="切换发布审核", emoji="🔍", style=discord.ButtonStyle.primary)
+    async def toggle_review(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.review_exempt = not self.review_exempt
+        await self._save(interaction)
+        await self.cog.bot.log_admin(
+            self.guild,
+            interaction.user,
+            f"👑 发布审核对管理员：{'豁免（管理员免审）' if self.review_exempt else '生效（管理员也需审核）'}",
+        )
+
+    @discord.ui.button(label="切换下载风控", emoji="🛡️", style=discord.ButtonStyle.primary)
+    async def toggle_risk(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.risk_exempt = not self.risk_exempt
+        await self._save(interaction)
+        await self.cog.bot.log_admin(
+            self.guild,
+            interaction.user,
+            f"👑 下载风控对管理员：{'豁免' if self.risk_exempt else '生效（管理员也受风控限制）'}",
         )
 
 
@@ -953,13 +1039,19 @@ class AdminCog(commands.Cog, name="管理"):
             channel = discord.utils.get(category.text_channels, name=STORAGE_CHANNEL_NAME)
             if channel is None:
                 try:
-                    channel = await category.create_text_channel(STORAGE_CHANNEL_NAME)
+                    channel = await category.create_text_channel(
+                        STORAGE_CHANNEL_NAME,
+                        overwrites=self.bot._storage_overwrites(interaction.guild),
+                    )
                 except discord.Forbidden:
                     await interaction.followup.send(
                         f"❌ Bot 缺少权限，无法在子区「{category.name}」下创建存储频道。",
                         ephemeral=True,
                     )
                     return
+            else:
+                # 复用现有存储频道时确保其为私密（@everyone 不可见）
+                await self.bot._ensure_channel_privacy(interaction.guild, channel)
             fields.update(
                 storage_category_id=category.id, storage_channel_id=channel.id
             )
@@ -1362,6 +1454,25 @@ class AdminCog(commands.Cog, name="管理"):
             interaction.guild,
             bool(settings and settings["review_enabled"]),
             settings["review_channel_id"] if settings else None,
+            bool(settings and settings["review_admin_exempt"]),
+        )
+        await interaction.response.send_message(
+            embed=view.make_embed(), view=view, ephemeral=True
+        )
+
+    @app_commands.command(
+        name="exempt_config",
+        description="管理员豁免设置：发布审核 / 下载风控是否对管理员生效（仅服务器所有者）",
+    )
+    @owner_only()
+    async def exempt_config(self, interaction: discord.Interaction):
+        assert interaction.guild is not None
+        settings = await self.bot.db.get_settings(interaction.guild.id)
+        view = ExemptConfigView(
+            self,
+            interaction.guild,
+            bool(settings and settings["review_admin_exempt"]),
+            bool(settings["risk_admin_exempt"]) if settings else True,
         )
         await interaction.response.send_message(
             embed=view.make_embed(), view=view, ephemeral=True

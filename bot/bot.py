@@ -17,7 +17,7 @@ STORAGE_CATEGORY_NAME = "📁 文件仓库"
 STORAGE_CHANNEL_NAME = "repository-storage"
 
 # 服务条款 / 隐私政策版本：内容实质性变更时递增，用户需重新同意
-TOS_VERSION = "2026-09-25"
+TOS_VERSION = "2026-09-25.2"
 
 
 class TosConsentView(discord.ui.View):
@@ -96,28 +96,55 @@ class RepoBot(commands.Bot):
         await self.load_extension("bot.cogs.admin")
 
     def build_tos_embed(self) -> discord.Embed:
-        """服务条款与隐私政策的同意提示嵌入（同意门与 /terms 共用）。"""
-        desc = (
-            "在使用本 Bot 前，请先阅读并同意服务条款与隐私政策：\n\n"
-            "• **服务条款**：文件上传 / 下载规范、下载审计、密码机制、风控与违规处置\n"
-            "• **隐私政策**：收集的数据（用户 ID、用户名、上传 / 下载记录等）及其用途与保存方式\n"
+        """服务条款与隐私政策的同意提示嵌入（同意门与 /terms 共用）。
+
+        内容为 GitHub 仓库中完整条款的要点摘录，并附完整阅读链接。
+        """
+        tos_url = self.config.tos_url or (
+            "https://github.com/Hum404/discord-repo-bot/blob/main/TERMS_OF_SERVICE.md"
         )
-        links = []
-        if self.config.tos_url:
-            links.append(f"[📜 服务条款全文]({self.config.tos_url})")
-        if self.config.privacy_url:
-            links.append(f"[🔒 隐私政策全文]({self.config.privacy_url})")
-        if links:
-            desc += "\n" + "　".join(links) + "\n"
-        desc += (
-            "\n点击「✅ 同意并继续」即表示你已阅读并同意上述条款（之后不再提示）；\n"
-            "点击「❌ 不同意」则无法使用本 Bot 的功能。"
+        privacy_url = self.config.privacy_url or (
+            "https://github.com/Hum404/discord-repo-bot/blob/main/PRIVACY_POLICY.md"
         )
-        return discord.Embed(
+        embed = discord.Embed(
             title="📜 服务条款与隐私政策",
-            description=desc,
+            description=(
+                "在使用本 Bot 前，请先阅读并同意服务条款与隐私政策。\n"
+                "以下为**要点摘录**，完整内容请点击下方 GitHub 链接阅读。"
+            ),
             color=discord.Color.blurple(),
         )
+        embed.add_field(
+            name="📜 服务条款 · 要点",
+            value=(
+                "• 本 Bot 免费提供文件存储与分发服务，按「现状」提供，不保证始终可用\n"
+                "• 禁止上传违法违规、侵权、恶意程序等内容；违规内容将被删除\n"
+                "• 管理员可删除 / 下架任何文件；开启发布审核时，上传须审核通过才公开\n"
+                "• 文件下载密码请勿使用真实账号密码；重要文件请自行备份\n"
+                "• 下载行为会被审计记录（谁、何时、下载了哪个文件）"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔒 隐私政策 · 要点",
+            value=(
+                "• 收集：文件元数据、上传 / 下载记录（用户 ID / 名称 / 时间）、\n"
+                "  管理操作日志、条款同意记录\n"
+                "• 用途：仅用于服务运营、安全审计与滥用追溯，不出售、不用于广告\n"
+                "• 存储：数据仅保存在服务器主自托管的 SQLite 数据库中\n"
+                "• 如需删除你的数据，请联系服务器管理员"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔗 完整阅读（GitHub）",
+            value=f"[📜 服务条款全文]({tos_url})\n[🔒 隐私政策全文]({privacy_url})",
+            inline=False,
+        )
+        embed.set_footer(
+            text=f"版本 {TOS_VERSION} · 点击「✅ 同意并继续」后不再提示；不同意则无法使用本 Bot"
+        )
+        return embed
 
     async def _tos_gate(self, interaction: discord.Interaction) -> bool:
         """全局指令检查：首次使用须先同意服务条款与隐私政策，不同意则无法使用。"""
@@ -185,6 +212,57 @@ class RepoBot(commands.Bot):
 
     # ───────────────────── 存储频道解析 ─────────────────────
 
+    @staticmethod
+    def _storage_overwrites(guild: discord.Guild) -> dict:
+        """存储分类 / 频道的私密权限覆写：@everyone 不可见，Bot 保留全权。"""
+        return {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_channels=True,
+                manage_messages=True,
+                attach_files=True,
+                embed_links=True,
+                read_message_history=True,
+            ),
+        }
+
+    async def _ensure_channel_privacy(
+        self, guild: discord.Guild, channel: discord.TextChannel
+    ) -> None:
+        """确保存储频道为私密：@everyone 不可见（保留已有的其他覆写）。"""
+        ow = channel.overwrites.get(guild.default_role)
+        if ow is not None and ow.view_channel is False:
+            return
+        overwrites = dict(channel.overwrites)
+        overwrites.update(self._storage_overwrites(guild))
+        try:
+            await channel.edit(overwrites=overwrites, reason="存储频道设为私密")
+            log.info("存储频道 #%s 已设为私密（%s）", channel.name, guild.id)
+        except discord.Forbidden:
+            log.warning("无权限将存储频道 #%s 设为私密（%s）", channel.name, guild.id)
+        except discord.HTTPException:
+            log.warning("设置存储频道 #%s 私密权限失败", channel.name, exc_info=True)
+
+    async def _ensure_category_privacy(
+        self, guild: discord.Guild, category: discord.CategoryChannel
+    ) -> None:
+        """确保存储分类及其下所有频道为私密。"""
+        ow = category.overwrites.get(guild.default_role)
+        if ow is None or ow.view_channel is not False:
+            overwrites = dict(category.overwrites)
+            overwrites.update(self._storage_overwrites(guild))
+            try:
+                await category.edit(overwrites=overwrites, reason="存储子区设为私密")
+                log.info("存储子区「%s」已设为私密（%s）", category.name, guild.id)
+            except discord.Forbidden:
+                log.warning("无权限将存储子区「%s」设为私密（%s）", category.name, guild.id)
+            except discord.HTTPException:
+                log.warning("设置存储子区私密权限失败", exc_info=True)
+        for ch in category.text_channels:
+            await self._ensure_channel_privacy(guild, ch)
+
     async def resolve_storage_channel(
         self, guild: discord.Guild
     ) -> tuple[discord.TextChannel | None, str | None]:
@@ -199,6 +277,7 @@ class RepoBot(commands.Bot):
         if settings and settings["storage_channel_id"]:
             channel = self.get_channel(settings["storage_channel_id"])
             if isinstance(channel, discord.TextChannel):
+                await self._ensure_channel_privacy(guild, channel)
                 return channel, None
             # 频道被删除，重置后继续走自动创建流程
             await self.db.upsert_settings(guild.id, storage_channel_id=None)
@@ -218,16 +297,25 @@ class RepoBot(commands.Bot):
             category = discord.utils.get(guild.categories, name=STORAGE_CATEGORY_NAME)
         if category is None:
             try:
-                category = await guild.create_category(STORAGE_CATEGORY_NAME)
+                category = await guild.create_category(
+                    STORAGE_CATEGORY_NAME, overwrites=self._storage_overwrites(guild)
+                )
             except discord.Forbidden:
                 return None, "缺少权限：无法创建存储分类（需要「管理频道」权限）。"
+        else:
+            # 已有的存储子区可能是历史遗留的公开子区，确保其为私密
+            await self._ensure_category_privacy(guild, category)
 
         channel = discord.utils.get(category.text_channels, name=STORAGE_CHANNEL_NAME)
         if channel is None:
             try:
-                channel = await category.create_text_channel(STORAGE_CHANNEL_NAME)
+                channel = await category.create_text_channel(
+                    STORAGE_CHANNEL_NAME, overwrites=category.overwrites
+                )
             except discord.Forbidden:
                 return None, "缺少权限：无法在存储分类下创建频道。"
+        else:
+            await self._ensure_channel_privacy(guild, channel)
 
         await self.db.upsert_settings(
             guild.id,
@@ -260,9 +348,13 @@ class RepoBot(commands.Bot):
         channel = discord.utils.get(storage_guild.text_channels, name=STORAGE_CHANNEL_NAME)
         if channel is None:
             try:
-                channel = await storage_guild.create_text_channel(STORAGE_CHANNEL_NAME)
+                channel = await storage_guild.create_text_channel(
+                    STORAGE_CHANNEL_NAME, overwrites=self._storage_overwrites(storage_guild)
+                )
             except discord.Forbidden:
                 return None, "Bot 在存储服务器中缺少「管理频道」权限，无法创建存储频道。"
+        else:
+            await self._ensure_channel_privacy(storage_guild, channel)
 
         await self.db.upsert_settings(
             guild.id, storage_guild_id=storage_guild_id, storage_channel_id=channel.id

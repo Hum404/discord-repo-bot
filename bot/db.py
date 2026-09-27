@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS files (
     password           TEXT,
     seq                INTEGER,
     status             TEXT NOT NULL DEFAULT 'approved',  -- 'approved' 已发布 | 'pending' 待审核
-    author_note        TEXT,                              -- 作者的话 / 免责声明
+    author_note        TEXT,                              -- 声明 / 免责声明
     review_message_id  INTEGER                            -- 审核工单消息 ID
 );
 
@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS settings (
     ticket_channel_id    INTEGER,                        -- 申诉工单发送频道
     review_enabled       INTEGER NOT NULL DEFAULT 0,     -- 发布审核开关
     review_channel_id    INTEGER,                        -- 审核频道（发布审核工单发送处）
+    review_admin_exempt  INTEGER NOT NULL DEFAULT 0,     -- 1=发布审核对管理员豁免（默认对管理员也生效）
+    risk_admin_exempt    INTEGER NOT NULL DEFAULT 1,     -- 1=下载风控对管理员豁免（默认豁免）
     vote_organize_channel  INTEGER NOT NULL DEFAULT 1,   -- /organize 当前频道所需管理员同意人数
     vote_organize_category INTEGER NOT NULL DEFAULT 2,   -- /organize 当前子区所需管理员同意人数
     vote_organize_guild    INTEGER NOT NULL DEFAULT 3,   -- /organize 整个服务器所需管理员同意人数
@@ -169,6 +171,8 @@ class Database:
             "ALTER TABLE settings ADD COLUMN ticket_channel_id INTEGER",
             "ALTER TABLE settings ADD COLUMN review_enabled INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN review_channel_id INTEGER",
+            "ALTER TABLE settings ADD COLUMN review_admin_exempt INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE settings ADD COLUMN risk_admin_exempt INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE settings ADD COLUMN vote_organize_category INTEGER NOT NULL DEFAULT 2",
             "ALTER TABLE settings ADD COLUMN vote_organize_channel INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE settings ADD COLUMN vote_organize_guild INTEGER NOT NULL DEFAULT 3",
