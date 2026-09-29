@@ -265,6 +265,205 @@ class DownloadPasswordModal(discord.ui.Modal, title="🔒 输入下载密码"):
         await self.cog._deliver_file(interaction, record)
 
 
+class DownloadSelect(discord.ui.Select):
+    """文件下拉选择器：选中即进入下载流程（密码弹窗或直接发送）。"""
+
+    def __init__(
+        self,
+        cog: "FilesCog",
+        rows,
+        placeholder: str = "📥 选择要下载的文件…",
+    ):
+        self.cog = cog
+        options = []
+        for r in rows[:25]:
+            no = f"#{r['seq']} " if r["seq"] else ""
+            options.append(
+                discord.SelectOption(
+                    label=f"{no}{r['name']}"[:100],
+                    description=f"{fmt_size(r['size'])} · 下载 {r['download_count']} 次"[:100],
+                    value=r["file_id"],
+                )
+            )
+        super().__init__(
+            placeholder=placeholder, options=options, min_values=1, max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        record = await self.cog.bot.db.get_file(self.values[0])
+        if record is None or record["status"] != "approved":
+            await interaction.response.send_message(
+                "❌ 文件已被删除或下架。", ephemeral=True
+            )
+            return
+        await self.cog.start_download(interaction, record)
+
+
+class FavToggleSelect(discord.ui.Select):
+    """收藏切换选择器：⭐=已收藏（选中取消），☆=未收藏（选中收藏）。"""
+
+    def __init__(self, cog: "FilesCog", rows, fav_ids: set):
+        self.cog = cog
+        options = []
+        for r in rows[:25]:
+            no = f"#{r['seq']} " if r["seq"] else ""
+            fav = r["file_id"] in fav_ids
+            options.append(
+                discord.SelectOption(
+                    label=f"{'⭐' if fav else '☆'} {no}{r['name']}"[:100],
+                    description="点击取消收藏" if fav else "点击收藏",
+                    value=r["file_id"],
+                )
+            )
+        super().__init__(
+            placeholder="⭐ 选择要收藏 / 取消收藏的文件…",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        record = await self.cog.bot.db.get_file(self.values[0])
+        if record is None:
+            await interaction.response.send_message("❌ 文件已被删除。", ephemeral=True)
+            return
+        added = await self.cog.bot.db.toggle_favorite(
+            interaction.guild.id, interaction.user.id, record["file_id"]
+        )
+        await interaction.response.send_message(
+            (f"⭐ 已收藏：`{record['name']}`（用 /favs 随时查看）")
+            if added
+            else (f"☆ 已取消收藏：`{record['name']}`"),
+            ephemeral=True,
+        )
+
+
+class DownloadPickView(discord.ui.View):
+    """通用下载选择面板：搜索 / 收藏 / 下载历史的结果页使用。"""
+
+    def __init__(self, cog: "FilesCog", rows):
+        super().__init__(timeout=600)
+        self.add_item(DownloadSelect(cog, rows))
+
+
+class RedownloadView(discord.ui.View):
+    """下载成功消息上的「再次下载」按钮（24 小时内有效）。"""
+
+    def __init__(self, cog: "FilesCog", file_id: str):
+        super().__init__(timeout=86400)
+        self.cog = cog
+        self.file_id = file_id
+
+    @discord.ui.button(label="🔁 再次下载", style=discord.ButtonStyle.secondary)
+    async def again(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        assert interaction.guild is not None
+        record = await self.cog.bot.db.get_file(self.file_id)
+        if record is None or record["status"] != "approved":
+            await interaction.response.send_message(
+                "❌ 文件已被删除或下架。", ephemeral=True
+            )
+            return
+        await self.cog.start_download(interaction, record)
+
+
+class FilesBrowseView(discord.ui.View):
+    """/files 浏览面板：翻页 + 下载选择 + 收藏切换。"""
+
+    def __init__(
+        self,
+        cog: "FilesCog",
+        guild_id: int,
+        user_id: int,
+        page: int,
+        per_page: int,
+        total: int,
+        rows,
+        fav_ids: set,
+    ):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.page = page
+        self.per_page = per_page
+        self.total_pages = max(1, (total + per_page - 1) // per_page)
+        self.add_item(DownloadSelect(cog, rows))
+        self.add_item(FavToggleSelect(cog, rows, fav_ids))
+        prev_btn = discord.ui.Button(
+            label="◀ 上一页",
+            style=discord.ButtonStyle.secondary,
+            disabled=page <= 1,
+            row=2,
+        )
+        prev_btn.callback = lambda i: self._goto(i, self.page - 1)
+        next_btn = discord.ui.Button(
+            label="下一页 ▶",
+            style=discord.ButtonStyle.secondary,
+            disabled=page >= self.total_pages,
+            row=2,
+        )
+        next_btn.callback = lambda i: self._goto(i, self.page + 1)
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "❌ 这是别人打开的列表，请用 /files 打开你自己的。", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _goto(self, interaction: discord.Interaction, page: int) -> None:
+        embed, view = await build_files_page(
+            self.cog, self.guild_id, self.user_id, page, self.per_page
+        )
+        if embed is None:
+            await interaction.response.send_message("❌ 没有这一页。", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def build_files_page(
+    cog: "FilesCog", guild_id: int, user_id: int, page: int, per_page: int = 10
+):
+    """构建 /files 某一页的 (embed, view)；没有内容时返回 (None, None)。"""
+    total = await cog.bot.db.count_files(guild_id)
+    rows = await cog.bot.db.list_files(
+        guild_id, limit=per_page, offset=(page - 1) * per_page
+    )
+    if not rows:
+        return None, None
+    fav_ids = await cog.bot.db.get_favorite_ids(guild_id, user_id)
+    embed = discord.Embed(
+        title=f"📚 文件仓库（第 {page} 页 / 共 {total} 个文件）",
+        color=discord.Color.blurple(),
+    )
+    for row in rows:
+        uploaded = datetime.fromtimestamp(row["uploaded_at"], tz=timezone.utc)
+        no = f"#{row['seq']} · " if row["seq"] else ""
+        star = "⭐ " if row["file_id"] in fav_ids else ""
+        embed.add_field(
+            name=f"{star}{no}`{row['file_id']}` · {row['name']}",
+            value=(
+                f"大小：{fmt_size(row['size'])} · 下载：{row['download_count']} 次\n"
+                f"上传者：<@{row['uploader_id']}> · "
+                f"<t:{int(uploaded.timestamp())}:R>"
+                + (f"\n📝 {row['description']}" if row["description"] else "")
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="下方菜单可直接选择下载或收藏，无需再记编号")
+    view = FilesBrowseView(
+        cog, guild_id, user_id, page, per_page, total, rows, fav_ids
+    )
+    return embed, view
+
+
 APPEAL_VOTES_REQUIRED = 2  # 解封/驳回各需的管理员票数（默认值，可用 /vote_config 按服务器调整）
 
 
@@ -1289,6 +1488,22 @@ class FilesCog(commands.Cog, name="文件"):
 
     # ────────────────────────── 下载 ──────────────────────────
 
+    async def start_download(
+        self, interaction: discord.Interaction, record
+    ) -> None:
+        """统一下载入口：加密文件先弹密码窗，否则直接发送。
+
+        Modal 必须是首个响应（不能先 defer），各入口（/download、下拉选择、
+        再次下载按钮）都走这里。
+        """
+        if record["password"]:
+            await interaction.response.send_modal(
+                DownloadPasswordModal(self, record["file_id"])
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self._deliver_file(interaction, record)
+
     @app_commands.command(name="download", description="从仓库下载文件（下载行为会被记录）")
     @app_commands.describe(file_id="文件编号（如 3）或文件 ID（可用 /files 查询）")
     async def download(self, interaction: discord.Interaction, file_id: str):
@@ -1299,14 +1514,7 @@ class FilesCog(commands.Cog, name="文件"):
                 "❌ 找不到该文件，请检查编号或文件 ID。", ephemeral=True
             )
             return
-        # 加密文件：先弹窗验证密码（Modal 必须是首个响应，不能先 defer）
-        if record["password"]:
-            await interaction.response.send_modal(
-                DownloadPasswordModal(self, record["file_id"])
-            )
-            return
-        await interaction.response.defer(ephemeral=True)
-        await self._deliver_file(interaction, record)
+        await self.start_download(interaction, record)
 
     async def _deliver_file(self, interaction: discord.Interaction, record) -> None:
         """从存储频道取回文件并发送，落库下载记录。调用前必须已 defer。"""
@@ -1388,18 +1596,29 @@ class FilesCog(commands.Cog, name="文件"):
         )
         await self.bot.send_log(interaction.guild, log_embed)
 
-        try:
-            await interaction.followup.send(
-                f"📦 `{record['name']}`（此下载已记录）",
-                file=discord.File(io.BytesIO(data), filename=record["name"]),
-                ephemeral=True,
-            )
-            # 风控：统计下载频率，触发阈值则自动封禁
-            await self._risk_track(interaction)
-        except discord.HTTPException:
-            await interaction.followup.send(
-                "❌ 发送文件失败（可能超出大小限制）。", ephemeral=True
-            )
+        view = RedownloadView(self, record["file_id"])
+        if len(data) <= interaction.guild.filesize_limit:
+            try:
+                await interaction.followup.send(
+                    f"📦 `{record['name']}`（此下载已记录）",
+                    file=discord.File(io.BytesIO(data), filename=record["name"]),
+                    ephemeral=True,
+                    view=view,
+                )
+                # 风控：统计下载频率，触发阈值则自动封禁
+                await self._risk_track(interaction)
+                return
+            except discord.HTTPException:
+                pass  # 超出 Bot 发送上限，回退为链接模式
+        await interaction.followup.send(
+            f"📦 `{record['name']}`（此下载已记录）\n"
+            f"文件较大无法直接发送，请通过链接下载：\n{attachment.url}\n"
+            "> 🔗 链接会过期，请尽快下载；请勿转发给他人。",
+            ephemeral=True,
+            view=view,
+        )
+        # 风控：统计下载频率，触发阈值则自动封禁
+        await self._risk_track(interaction)
 
     # ────────────────────────── 浏览 / 搜索 ──────────────────────────
 
@@ -1408,36 +1627,16 @@ class FilesCog(commands.Cog, name="文件"):
     async def files(self, interaction: discord.Interaction, page: int = 1):
         assert interaction.guild is not None
         page = max(page, 1)
-        per_page = 10
-        total = await self.bot.db.count_files(interaction.guild.id)
-        rows = await self.bot.db.list_files(
-            interaction.guild.id, limit=per_page, offset=(page - 1) * per_page
+        embed, view = await build_files_page(
+            self, interaction.guild.id, interaction.user.id, page
         )
-        if not rows:
+        if embed is None:
             await interaction.response.send_message(
                 "📭 仓库空空如也。" if page == 1 else "❌ 没有这一页。",
                 ephemeral=True,
             )
             return
-
-        embed = discord.Embed(
-            title=f"📚 文件仓库（第 {page} 页 / 共 {total} 个文件）",
-            color=discord.Color.blurple(),
-        )
-        for row in rows:
-            uploaded = datetime.fromtimestamp(row["uploaded_at"], tz=timezone.utc)
-            no = f"#{row['seq']} · " if row["seq"] else ""
-            embed.add_field(
-                name=f"{no}`{row['file_id']}` · {row['name']}",
-                value=(
-                    f"大小：{fmt_size(row['size'])} · 下载：{row['download_count']} 次\n"
-                    f"上传者：<@{row['uploader_id']}> · "
-                    f"<t:{int(uploaded.timestamp())}:R>"
-                    + (f"\n📝 {row['description']}" if row["description"] else "")
-                ),
-                inline=False,
-            )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="search", description="按文件名或描述搜索")
     @app_commands.describe(keyword="关键词")
@@ -1463,7 +1662,90 @@ class FilesCog(commands.Cog, name="文件"):
                 ),
                 inline=False,
             )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed.set_footer(text="下方菜单可直接选择下载")
+        await interaction.response.send_message(
+            embed=embed, view=DownloadPickView(self, rows), ephemeral=True
+        )
+
+    @app_commands.command(name="fav", description="收藏 / 取消收藏一个文件")
+    @app_commands.describe(file_id="文件编号或文件 ID")
+    async def fav(self, interaction: discord.Interaction, file_id: str):
+        assert interaction.guild is not None
+        record = await self._resolve_file(interaction.guild.id, file_id)
+        if record is None:
+            await interaction.response.send_message("❌ 找不到该文件。", ephemeral=True)
+            return
+        added = await self.bot.db.toggle_favorite(
+            interaction.guild.id, interaction.user.id, record["file_id"]
+        )
+        await interaction.response.send_message(
+            (f"⭐ 已收藏：`{record['name']}`（用 /favs 随时查看）")
+            if added
+            else (f"☆ 已取消收藏：`{record['name']}`"),
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="favs", description="查看我收藏的文件，可直接选择下载")
+    async def favs(self, interaction: discord.Interaction):
+        assert interaction.guild is not None
+        rows = await self.bot.db.list_favorites(
+            interaction.guild.id, interaction.user.id
+        )
+        if not rows:
+            await interaction.response.send_message(
+                "⭐ 你还没有收藏任何文件。\n"
+                "在 /files 列表的收藏菜单里选，或用 /fav 文件编号。",
+                ephemeral=True,
+            )
+            return
+        embed = discord.Embed(
+            title=f"⭐ 我的收藏（{len(rows)} 个）", color=discord.Color.blurple()
+        )
+        for row in rows:
+            no = f"#{row['seq']} · " if row["seq"] else ""
+            embed.add_field(
+                name=f"{no}`{row['file_id']}` · {row['name']}",
+                value=(
+                    f"大小：{fmt_size(row['size'])} · 下载：{row['download_count']} 次 · "
+                    f"上传者：<@{row['uploader_id']}>"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text="下方菜单可直接选择下载；用 /fav 可取消收藏")
+        await interaction.response.send_message(
+            embed=embed, view=DownloadPickView(self, rows), ephemeral=True
+        )
+
+    @app_commands.command(
+        name="mydownloads", description="查看我最近下载过的文件，可直接再次下载"
+    )
+    async def mydownloads(self, interaction: discord.Interaction):
+        assert interaction.guild is not None
+        rows = await self.bot.db.get_user_download_files(
+            interaction.guild.id, interaction.user.id
+        )
+        if not rows:
+            await interaction.response.send_message(
+                "📭 你还没有下载过文件。", ephemeral=True
+            )
+            return
+        embed = discord.Embed(
+            title="🕘 我的下载历史", color=discord.Color.blurple()
+        )
+        for row in rows:
+            no = f"#{row['seq']} · " if row["seq"] else ""
+            embed.add_field(
+                name=f"{no}`{row['file_id']}` · {row['name']}",
+                value=(
+                    f"大小：{fmt_size(row['size'])} · 我下载过 {row['my_downloads']} 次 · "
+                    f"最近 <t:{int(row['last_downloaded_at'])}:R>"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text="下方菜单可直接选择再次下载")
+        await interaction.response.send_message(
+            embed=embed, view=DownloadPickView(self, rows), ephemeral=True
+        )
 
     @app_commands.command(name="terms", description="查看服务条款与隐私政策（首次使用需同意）")
     async def terms(self, interaction: discord.Interaction):

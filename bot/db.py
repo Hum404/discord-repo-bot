@@ -131,6 +131,15 @@ CREATE TABLE IF NOT EXISTS tos_consent (
     version   TEXT NOT NULL,
     PRIMARY KEY (guild_id, user_id)
 );
+
+-- 用户收藏的文件
+CREATE TABLE IF NOT EXISTS favorites (
+    guild_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    file_id    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id, file_id)
+);
 """
 
 
@@ -628,6 +637,7 @@ class Database:
     async def delete_file(self, file_id: str) -> None:
         await self.conn.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
         await self.conn.execute("DELETE FROM downloads WHERE file_id = ?", (file_id,))
+        await self.conn.execute("DELETE FROM favorites WHERE file_id = ?", (file_id,))
         await self.conn.commit()
 
     async def purge_guild(self, guild_id: int) -> dict:
@@ -648,6 +658,11 @@ class Database:
             )
             await self.conn.execute(
                 "DELETE FROM files WHERE origin_guild_id = ?", (guild_id,)
+            )
+            await self.conn.execute(
+                "DELETE FROM favorites WHERE guild_id = ? OR file_id IN "
+                "(SELECT file_id FROM files WHERE origin_guild_id = ?)",
+                (guild_id, guild_id),
             )
             await self.conn.execute(
                 "DELETE FROM settings WHERE guild_id = ?", (guild_id,)
@@ -739,6 +754,66 @@ class Database:
             ORDER BY downloaded_at DESC LIMIT ?
             """,
             (file_id, limit),
+        )
+        return await cur.fetchall()
+
+    async def toggle_favorite(self, guild_id: int, user_id: int, file_id: str) -> bool:
+        """收藏切换：返回 True=已收藏，False=已取消收藏。"""
+        cur = await self.conn.execute(
+            "SELECT 1 FROM favorites WHERE guild_id = ? AND user_id = ? AND file_id = ?",
+            (guild_id, user_id, file_id),
+        )
+        if await cur.fetchone():
+            await self.conn.execute(
+                "DELETE FROM favorites WHERE guild_id = ? AND user_id = ? AND file_id = ?",
+                (guild_id, user_id, file_id),
+            )
+            await self.conn.commit()
+            return False
+        await self.conn.execute(
+            "INSERT INTO favorites (guild_id, user_id, file_id, created_at) VALUES (?, ?, ?, ?)",
+            (guild_id, user_id, file_id, int(time.time())),
+        )
+        await self.conn.commit()
+        return True
+
+    async def get_favorite_ids(self, guild_id: int, user_id: int) -> set[str]:
+        cur = await self.conn.execute(
+            "SELECT file_id FROM favorites WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        return {row[0] for row in await cur.fetchall()}
+
+    async def list_favorites(
+        self, guild_id: int, user_id: int, *, limit: int = 25
+    ) -> list[aiosqlite.Row]:
+        """我收藏的文件（仍在上架状态），按收藏时间倒序。"""
+        cur = await self.conn.execute(
+            """
+            SELECT f.* FROM favorites fav
+            JOIN files f ON f.file_id = fav.file_id
+            WHERE fav.guild_id = ? AND fav.user_id = ? AND f.status = 'approved'
+            ORDER BY fav.created_at DESC LIMIT ?
+            """,
+            (guild_id, user_id, limit),
+        )
+        return await cur.fetchall()
+
+    async def get_user_download_files(
+        self, guild_id: int, user_id: int, *, limit: int = 10
+    ) -> list[aiosqlite.Row]:
+        """我最近下载过的文件（去重，仍在上架状态），按最近下载时间倒序。"""
+        cur = await self.conn.execute(
+            """
+            SELECT f.*, MAX(d.downloaded_at) AS last_downloaded_at,
+                   COUNT(*) AS my_downloads
+            FROM downloads d
+            JOIN files f ON f.file_id = d.file_id
+            WHERE d.guild_id = ? AND d.user_id = ? AND f.status = 'approved'
+            GROUP BY d.file_id
+            ORDER BY last_downloaded_at DESC LIMIT ?
+            """,
+            (guild_id, user_id, limit),
         )
         return await cur.fetchall()
 
