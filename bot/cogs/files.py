@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import discord
 from discord import app_commands
@@ -584,6 +585,174 @@ class ShowcaseCardView(discord.ui.View):
         )
 
 
+def build_collection_embed(author_name: str, protected, plain) -> discord.Embed:
+    """作者合集面板：按「受保护 / 普通」分组列出作者全部已发布文件。"""
+    embed = discord.Embed(
+        title=f"📄 {author_name} 的合集",
+        description="资源已按模式分类。请从下面的下拉菜单中选择一项进行下载。",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    def fmt_group(files) -> str:
+        if not files:
+            return "无"
+        lines = []
+        for r in files[:15]:
+            no = f"#{r['seq']} " if r["seq"] else ""
+            lines.append(f"🔹 **{no}{r['name']}**（`{fmt_size(r['size'])}`）")
+        if len(files) > 15:
+            lines.append(f"…共 {len(files)} 个，其余见下拉菜单")
+        return "\n".join(lines)
+
+    embed.add_field(name="🔒 受保护资源", value=fmt_group(protected), inline=False)
+    embed.add_field(name="📄 资源", value=fmt_group(plain), inline=False)
+    embed.set_footer(text="下拉选择即下载 · 下载行为会被记录")
+    return embed
+
+
+class CollectionView(discord.ui.View):
+    """作者合集面板上的下载下拉菜单（持久视图，重启后恢复）。"""
+
+    def __init__(self, cog: "FilesCog", author_id: int, protected, plain):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.author_id = author_id
+        added = False
+        for key, placeholder, files in (
+            ("p", "🔒 请选择受保护资源进行下载…", protected),
+            ("u", "📄 请选择资源进行下载…", plain),
+        ):
+            if not files:
+                continue
+            options = []
+            for r in files[:25]:
+                no = f"#{r['seq']} " if r["seq"] else ""
+                date = datetime.fromtimestamp(
+                    r["uploaded_at"], tz=timezone.utc
+                ).strftime("%Y/%m/%d")
+                options.append(
+                    discord.SelectOption(
+                        label=f"{no}{r['name']}"[:100],
+                        description=f"{date} · {fmt_size(r['size'])}"[:100],
+                        value=r["file_id"],
+                        emoji="🔒" if r["password"] else "📄",
+                    )
+                )
+            if len(files) > 25:
+                placeholder += "（仅显示最新 25 个）"
+            select = discord.ui.Select(
+                placeholder=placeholder[:150],
+                options=options,
+                custom_id=f"collection_{key}:{author_id}",
+            )
+            select.callback = self._pick
+            self.add_item(select)
+            added = True
+        if not added:
+            empty = discord.ui.Select(
+                placeholder="合集中暂无文件",
+                options=[discord.SelectOption(label="暂无文件", value="none")],
+                custom_id=f"collection_e:{author_id}",
+                disabled=True,
+            )
+            self.add_item(empty)
+
+    async def _pick(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        file_id = interaction.data["values"][0]
+        # 下拉不走指令检查，这里补首次使用的条款门
+        try:
+            consented = await self.cog.bot.db.has_consent(
+                interaction.guild.id, interaction.user.id, TOS_VERSION
+            )
+        except Exception:
+            consented = True  # 数据库异常不阻断
+        if not consented:
+            await interaction.response.send_message(
+                embed=self.cog.bot.build_tos_embed(),
+                view=TosConsentView(self.cog.bot, interaction.user),
+                ephemeral=True,
+            )
+            return
+        record = await self.cog.bot.db.get_file(file_id)
+        if record is None or record["status"] != "approved":
+            await interaction.response.send_message(
+                "❌ 文件已被删除或下架。", ephemeral=True
+            )
+            return
+        await self.cog.start_download(interaction, record)
+
+
+class BatchUploadModal(discord.ui.Modal, title="批量上传设置（应用于全部文件）"):
+    """批量上传的共享设置：下载密码 / 声明（均可选）。"""
+
+    password = discord.ui.TextInput(
+        label="下载密码（可选，全部文件共用）",
+        required=False,
+        max_length=64,
+        placeholder="留空则全部公开下载",
+    )
+    author_note = discord.ui.TextInput(
+        label="声明（可选，全部文件共用）",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000,
+    )
+
+    def __init__(
+        self, cog: "FilesCog", files: list[discord.Attachment], description: str
+    ):
+        super().__init__()
+        self.cog = cog
+        self.files = files
+        self.description = description
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        await interaction.response.defer(ephemeral=True)
+        password = self.password.value.strip() or None
+        note = self.author_note.value.strip()
+        guild = interaction.guild
+        limit = self.cog.bot.config.max_file_size_mb * 1024 * 1024
+        results = []
+        for att in self.files:
+            if att.size > limit:
+                results.append(f"❌ `{att.filename}`：超过大小上限，已跳过")
+                continue
+            try:
+                data = await asyncio.wait_for(att.read(), timeout=180)
+            except Exception:
+                results.append(f"❌ `{att.filename}`：附件读取失败，已跳过")
+                continue
+            prep = SimpleNamespace(
+                guild=guild,
+                uploader=interaction.user,
+                attachment=att,
+                name=att.filename,
+                original_name=att.filename,
+                data=data,
+                description=self.description,
+                password=password,
+                author_note=note,
+            )
+            try:
+                await self.cog._do_upload(interaction, prep)
+                results.append(f"✅ `{att.filename}`（{fmt_size(att.size)}）")
+            except Exception:
+                log.exception("批量上传失败：%s", att.filename)
+                results.append(f"❌ `{att.filename}`：上传失败")
+            await asyncio.sleep(1)  # 缓一缓，避免触发 Discord 限流
+        embed = discord.Embed(
+            title=f"📦 批量上传完成（共 {len(self.files)} 个文件）",
+            description="\n".join(results)[:4000],
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="需要单独设置密码/改名的文件，请使用 /upload")
+        await interaction.edit_original_response(embed=embed, view=None)
+
+
 APPEAL_VOTES_REQUIRED = 2  # 解封/驳回各需的管理员票数（默认值，可用 /vote_config 按服务器调整）
 
 
@@ -960,6 +1129,11 @@ class PublishReviewView(discord.ui.View):
         cog = self.bot.get_cog("文件")
         if cog is not None:
             await cog._post_showcase_card(interaction.guild, self.file_id)
+            rec = await self.bot.db.get_file(self.file_id)
+            if rec is not None:
+                await cog._refresh_collection_panel(
+                    interaction.guild, rec["uploader_id"]
+                )
         await interaction.response.edit_message(
             embed=self._settle_embed(interaction, "✅ 审核通过，已发布", discord.Color.green()),
             view=self,
@@ -1115,6 +1289,25 @@ class FilesCog(commands.Cog, name="文件"):
             )
         if cards:
             log.info("已恢复 %d 张展示卡片的按钮", len(cards))
+        # 恢复作者合集面板的下拉菜单
+        try:
+            panels = await self.bot.db.list_collections()
+        except Exception:
+            log.exception("读取合集面板失败")
+            panels = []
+        for row in panels:
+            try:
+                protected, plain = await self._build_collection(
+                    row["guild_id"], row["author_id"]
+                )
+            except Exception:
+                protected, plain = [], []
+            self.bot.add_view(
+                CollectionView(self, row["author_id"], protected, plain),
+                message_id=row["message_id"],
+            )
+        if panels:
+            log.info("已恢复 %d 张合集面板", len(panels))
         self._review_sweeper.start()
 
     async def cog_unload(self) -> None:
@@ -1397,6 +1590,131 @@ class FilesCog(commands.Cog, name="文件"):
         )
         await interaction.followup.send(embed=view.make_embed(), view=view, ephemeral=True)
 
+    @app_commands.command(
+        name="upload_batch", description="批量上传文件（一次最多 10 个，共享密码/声明）"
+    )
+    @app_commands.describe(
+        file1="文件 1",
+        file2="文件 2（可选）",
+        file3="文件 3（可选）",
+        file4="文件 4（可选）",
+        file5="文件 5（可选）",
+        file6="文件 6（可选）",
+        file7="文件 7（可选）",
+        file8="文件 8（可选）",
+        file9="文件 9（可选）",
+        file10="文件 10（可选）",
+        description="文件描述（可选，应用于全部文件）",
+    )
+    async def upload_batch(
+        self,
+        interaction: discord.Interaction,
+        file1: discord.Attachment,
+        file2: discord.Attachment | None = None,
+        file3: discord.Attachment | None = None,
+        file4: discord.Attachment | None = None,
+        file5: discord.Attachment | None = None,
+        file6: discord.Attachment | None = None,
+        file7: discord.Attachment | None = None,
+        file8: discord.Attachment | None = None,
+        file9: discord.Attachment | None = None,
+        file10: discord.Attachment | None = None,
+        description: str = "",
+    ) -> None:
+        files = [
+            f
+            for f in (
+                file1, file2, file3, file4, file5,
+                file6, file7, file8, file9, file10,
+            )
+            if f is not None
+        ]
+        limit = self.bot.config.max_file_size_mb * 1024 * 1024
+        oversized = [f.filename for f in files if f.size > limit]
+        if oversized:
+            await interaction.response.send_message(
+                "❌ 以下文件超过大小上限"
+                f"（{self.bot.config.max_file_size_mb} MB），请移除后重试：\n"
+                + "\n".join(f"· `{n}`" for n in oversized),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(
+            BatchUploadModal(self, files, description)
+        )
+
+    @app_commands.command(
+        name="collection",
+        description="开启/关闭你的文件合集面板（下拉即可下载你的全部文件）",
+    )
+    @app_commands.describe(
+        action="开启：在当前频道发布合集面板；关闭：删除面板"
+    )
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="开启", value="on"),
+            app_commands.Choice(name="关闭", value="off"),
+        ]
+    )
+    async def collection(
+        self, interaction: discord.Interaction, action: app_commands.Choice[str]
+    ) -> None:
+        assert interaction.guild is not None
+        guild = interaction.guild
+        author = interaction.user
+
+        if action.value == "off":
+            row = await self.bot.db.get_collection(guild.id, author.id)
+            if row is None:
+                await interaction.response.send_message(
+                    "ℹ️ 你还没有开启合集。", ephemeral=True
+                )
+                return
+            channel = guild.get_channel(row["channel_id"])
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(row["message_id"])
+                    await msg.delete()
+                except discord.HTTPException:
+                    pass
+            await self.bot.db.delete_collection(guild.id, author.id)
+            await interaction.response.send_message(
+                "✅ 合集已关闭，面板消息已删除。", ephemeral=True
+            )
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ 请在文字频道中使用本指令（面板会发布到当前频道）。",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        # 已有旧面板：删除旧消息后重建（相当于迁移到当前频道）
+        old = await self.bot.db.get_collection(guild.id, author.id)
+        if old is not None:
+            old_ch = guild.get_channel(old["channel_id"])
+            if isinstance(old_ch, discord.TextChannel):
+                try:
+                    old_msg = await old_ch.fetch_message(old["message_id"])
+                    await old_msg.delete()
+                except discord.HTTPException:
+                    pass
+        protected, plain = await self._build_collection(guild.id, author.id)
+        msg = await interaction.channel.send(
+            embed=build_collection_embed(author.display_name, protected, plain),
+            view=CollectionView(self, author.id, protected, plain),
+        )
+        await self.bot.db.upsert_collection(
+            guild.id, author.id, interaction.channel.id, msg.id
+        )
+        await interaction.followup.send(
+            f"✅ 合集面板已发布：{msg.jump_url}\n"
+            "之后你上传/删除文件时面板会自动刷新；"
+            "想换频道的话，在目标频道再执行一次 `/collection 开启` 即可。",
+            ephemeral=True,
+        )
+
     async def _do_upload(self, interaction: discord.Interaction, prep: UploadPrepView) -> None:
         """确认上传：写入存储频道并登记入库。"""
         guild = prep.guild
@@ -1540,6 +1858,9 @@ class FilesCog(commands.Cog, name="文件"):
         # 展示频道：发布文件卡片（未配置则自动跳过）
         await self._post_showcase_card(guild, file_id)
 
+        # 作者合集：开启了合集则刷新面板
+        await self._refresh_collection_panel(guild, uploader.id)
+
         # 管理日志：上传时重命名同步记录
         if prep.name != prep.original_name:
             await self.bot.log_admin(
@@ -1643,6 +1964,47 @@ class FilesCog(commands.Cog, name="文件"):
             return
         await interaction.response.defer(ephemeral=True)
         await self._deliver_file(interaction, record)
+
+    async def _build_collection(self, guild_id: int, author_id: int):
+        """取出作者已发布文件，按受保护/普通分组。"""
+        files = await self.bot.db.list_uploader_files(guild_id, author_id)
+        protected = [r for r in files if r["password"]]
+        plain = [r for r in files if not r["password"]]
+        return protected, plain
+
+    async def _refresh_collection_panel(
+        self, guild: discord.Guild, author_id: int
+    ) -> None:
+        """作者文件变动后刷新其合集面板（未开启合集则自动跳过）。"""
+        try:
+            row = await self.bot.db.get_collection(guild.id, author_id)
+            if row is None:
+                return
+            channel = guild.get_channel(row["channel_id"])
+            if not isinstance(channel, discord.TextChannel):
+                try:
+                    fetched = await guild.fetch_channel(row["channel_id"])
+                    channel = (
+                        fetched if isinstance(fetched, discord.TextChannel) else None
+                    )
+                except discord.HTTPException:
+                    channel = None
+            if channel is None:
+                return
+            try:
+                message = await channel.fetch_message(row["message_id"])
+            except discord.NotFound:
+                await self.bot.db.delete_collection(guild.id, author_id)
+                return
+            member = guild.get_member(author_id)
+            name = member.display_name if member else f"用户 {author_id}"
+            protected, plain = await self._build_collection(guild.id, author_id)
+            await message.edit(
+                embed=build_collection_embed(name, protected, plain),
+                view=CollectionView(self, author_id, protected, plain),
+            )
+        except Exception:
+            log.exception("刷新合集面板失败（guild=%s author=%s）", guild.id, author_id)
 
     async def _post_showcase_card(self, guild: discord.Guild, file_id: str) -> None:
         """文件发布后在展示频道发卡片（带下载/收藏按钮）。未配置展示频道则跳过。"""
@@ -2128,6 +2490,8 @@ class FilesCog(commands.Cog, name="文件"):
         await self._delete_showcase_card(interaction.guild, record)
 
         await self.bot.db.delete_file(record["file_id"])
+        # 作者开启了合集则刷新面板
+        await self._refresh_collection_panel(interaction.guild, record["uploader_id"])
         if is_admin and not is_uploader:
             await self.bot.log_admin(
                 interaction.guild,

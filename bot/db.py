@@ -140,6 +140,16 @@ CREATE TABLE IF NOT EXISTS favorites (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (guild_id, user_id, file_id)
 );
+
+-- 作者合集面板（每个作者每个服务器一张）
+CREATE TABLE IF NOT EXISTS collections (
+    guild_id   INTEGER NOT NULL,
+    author_id  INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, author_id)
+);
 """
 
 
@@ -667,6 +677,9 @@ class Database:
                 (guild_id, guild_id),
             )
             await self.conn.execute(
+                "DELETE FROM collections WHERE guild_id = ?", (guild_id,)
+            )
+            await self.conn.execute(
                 "DELETE FROM settings WHERE guild_id = ?", (guild_id,)
             )
             await self.conn.commit()
@@ -798,6 +811,61 @@ class Database:
             ORDER BY fav.created_at DESC LIMIT ?
             """,
             (guild_id, user_id, limit),
+        )
+        return await cur.fetchall()
+
+    # ── 作者合集面板 ─────────────────────────────────────────────
+
+    async def upsert_collection(
+        self, guild_id: int, author_id: int, channel_id: int, message_id: int
+    ) -> None:
+        async with self._write_lock:
+            await self.conn.execute(
+                "INSERT OR REPLACE INTO collections "
+                "(guild_id, author_id, channel_id, message_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (guild_id, author_id, channel_id, message_id, int(time.time())),
+            )
+            await self.conn.commit()
+
+    async def get_collection(
+        self, guild_id: int, author_id: int
+    ) -> aiosqlite.Row | None:
+        cur = await self.conn.execute(
+            "SELECT * FROM collections WHERE guild_id = ? AND author_id = ?",
+            (guild_id, author_id),
+        )
+        return await cur.fetchone()
+
+    async def list_collections(self) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute("SELECT * FROM collections")
+        return await cur.fetchall()
+
+    async def list_collections_in_guild(self, guild_id: int) -> list[aiosqlite.Row]:
+        cur = await self.conn.execute(
+            "SELECT * FROM collections WHERE guild_id = ?", (guild_id,)
+        )
+        return await cur.fetchall()
+
+    async def delete_collection(self, guild_id: int, author_id: int) -> None:
+        async with self._write_lock:
+            await self.conn.execute(
+                "DELETE FROM collections WHERE guild_id = ? AND author_id = ?",
+                (guild_id, author_id),
+            )
+            await self.conn.commit()
+
+    async def list_uploader_files(
+        self, guild_id: int, author_id: int, limit: int = 50
+    ) -> list[aiosqlite.Row]:
+        """某作者在本服务器的已发布文件（新→旧），供合集面板使用。"""
+        cur = await self.conn.execute(
+            """
+            SELECT * FROM files
+            WHERE origin_guild_id = ? AND uploader_id = ? AND status = 'approved'
+            ORDER BY uploaded_at DESC LIMIT ?
+            """,
+            (guild_id, author_id, limit),
         )
         return await cur.fetchall()
 

@@ -1972,6 +1972,20 @@ class AdminCog(commands.Cog, name="管理"):
         except Exception:
             log.exception("清除展示卡片失败（不阻塞初始化）")
 
+        # 清除作者合集面板消息（数据库行随 purge_guild 一并删除）
+        try:
+            panels = await self.bot.db.list_collections_in_guild(guild.id)
+            for row in panels:
+                ch = guild.get_channel(row["channel_id"])
+                if isinstance(ch, discord.TextChannel):
+                    try:
+                        panel_msg = await ch.fetch_message(row["message_id"])
+                        await panel_msg.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+        except Exception:
+            log.exception("清除合集面板失败（不阻塞初始化）")
+
         stats = await self.bot.db.purge_guild(guild.id)
         stats["channel_deleted"] = channel_deleted
 
