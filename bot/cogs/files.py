@@ -12,7 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from ..bot import RepoBot, TosConsentView, fmt_size
+from ..bot import TOS_VERSION, RepoBot, TosConsentView, fmt_size
 
 log = logging.getLogger("repo-bot")
 
@@ -464,6 +464,126 @@ async def build_files_page(
     return embed, view
 
 
+async def file_ref_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """文件编号/ID 参数的自动补全：按编号精确或名称/描述模糊匹配。"""
+    if interaction.guild is None:
+        return []
+    try:
+        rows = await interaction.client.db.search_file_refs(
+            interaction.guild.id, current
+        )
+    except Exception:
+        return []
+    choices = []
+    for r in rows:
+        ref = str(r["seq"]) if r["seq"] else r["file_id"]
+        lock = "🔒" if r["password"] else "📦"
+        no = f"#{r['seq']} " if r["seq"] else ""
+        choices.append(
+            app_commands.Choice(name=f"{lock} {no}{r['name']}"[:100], value=ref)
+        )
+    return choices
+
+
+def build_showcase_embed(record) -> discord.Embed:
+    """展示频道里的文件卡片。"""
+    no = f"#{record['seq']} · " if record["seq"] else ""
+    embed = discord.Embed(
+        title=f"📦 {no}{record['name']}",
+        color=discord.Color.blurple(),
+        timestamp=datetime.fromtimestamp(record["uploaded_at"], tz=timezone.utc),
+    )
+    desc = (
+        f"💾 大小：{fmt_size(record['size'])} · "
+        f"{'🔒 需密码' if record['password'] else '🔓 公开'} · "
+        f"📥 已被下载 {record['download_count']} 次\n"
+        f"👤 上传者：<@{record['uploader_id']}>"
+    )
+    if record["description"]:
+        desc += f"\n📝 {record['description']}"
+    if record["author_note"]:
+        desc += f"\n📜 {record['author_note'][:150]}"
+    embed.description = desc
+    embed.set_footer(text="点击下方「下载」获取文件 · 下载行为会被记录")
+    return embed
+
+
+class ShowcaseCardView(discord.ui.View):
+    """展示频道文件卡片上的「下载 / 收藏」按钮（持久视图，重启后恢复）。"""
+
+    def __init__(self, cog: "FilesCog", file_id: str):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.file_id = file_id
+        dl_btn = discord.ui.Button(
+            label="📥 下载",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"showcase_dl:{file_id}",
+        )
+        dl_btn.callback = self._download
+        fav_btn = discord.ui.Button(
+            label="⭐ 收藏",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"showcase_fav:{file_id}",
+        )
+        fav_btn.callback = self._fav
+        self.add_item(dl_btn)
+        self.add_item(fav_btn)
+
+    async def _check_consent(self, interaction: discord.Interaction) -> bool:
+        """卡片按钮不走指令检查，这里补首次使用的条款门。"""
+        try:
+            if await self.cog.bot.db.has_consent(
+                interaction.guild.id, interaction.user.id, TOS_VERSION
+            ):
+                return True
+        except Exception:
+            return True  # 数据库异常不阻断
+        await interaction.response.send_message(
+            embed=self.cog.bot.build_tos_embed(),
+            view=TosConsentView(self.cog.bot, interaction.user),
+            ephemeral=True,
+        )
+        return False
+
+    async def _load_record(self, interaction: discord.Interaction):
+        record = await self.cog.bot.db.get_file(self.file_id)
+        if record is None or record["status"] != "approved":
+            await interaction.response.send_message(
+                "❌ 文件已被删除或下架。", ephemeral=True
+            )
+            return None
+        return record
+
+    async def _download(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        if not await self._check_consent(interaction):
+            return
+        record = await self._load_record(interaction)
+        if record is None:
+            return
+        await self.cog.start_download(interaction, record)
+
+    async def _fav(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        if not await self._check_consent(interaction):
+            return
+        record = await self._load_record(interaction)
+        if record is None:
+            return
+        added = await self.cog.bot.db.toggle_favorite(
+            interaction.guild.id, interaction.user.id, record["file_id"]
+        )
+        await interaction.response.send_message(
+            (f"⭐ 已收藏：`{record['name']}`（用 /favs 随时查看）")
+            if added
+            else (f"☆ 已取消收藏：`{record['name']}`"),
+            ephemeral=True,
+        )
+
+
 APPEAL_VOTES_REQUIRED = 2  # 解封/驳回各需的管理员票数（默认值，可用 /vote_config 按服务器调整）
 
 
@@ -836,6 +956,10 @@ class PublishReviewView(discord.ui.View):
                     await storage_msg.edit(embed=card)
         except discord.HTTPException:
             pass
+        # 展示频道：审核通过后发布文件卡片
+        cog = self.bot.get_cog("文件")
+        if cog is not None:
+            await cog._post_showcase_card(interaction.guild, self.file_id)
         await interaction.response.edit_message(
             embed=self._settle_embed(interaction, "✅ 审核通过，已发布", discord.Color.green()),
             view=self,
@@ -978,6 +1102,19 @@ class FilesCog(commands.Cog, name="文件"):
             )
         if pending_files:
             log.info("已恢复 %d 个发布审核工单的按钮", len(pending_files))
+        # 恢复展示频道卡片的下载/收藏按钮
+        try:
+            cards = await self.bot.db.list_showcase_cards()
+        except Exception:
+            log.exception("读取展示卡片失败")
+            cards = []
+        for row in cards:
+            self.bot.add_view(
+                ShowcaseCardView(self, row["file_id"]),
+                message_id=row["showcase_message_id"],
+            )
+        if cards:
+            log.info("已恢复 %d 张展示卡片的按钮", len(cards))
         self._review_sweeper.start()
 
     async def cog_unload(self) -> None:
@@ -1400,6 +1537,9 @@ class FilesCog(commands.Cog, name="文件"):
             log_embed.add_field(name="声明", value=prep.author_note[:1024], inline=False)
         await self.bot.send_log(guild, log_embed)
 
+        # 展示频道：发布文件卡片（未配置则自动跳过）
+        await self._post_showcase_card(guild, file_id)
+
         # 管理日志：上传时重命名同步记录
         if prep.name != prep.original_name:
             await self.bot.log_admin(
@@ -1504,8 +1644,52 @@ class FilesCog(commands.Cog, name="文件"):
         await interaction.response.defer(ephemeral=True)
         await self._deliver_file(interaction, record)
 
+    async def _post_showcase_card(self, guild: discord.Guild, file_id: str) -> None:
+        """文件发布后在展示频道发卡片（带下载/收藏按钮）。未配置展示频道则跳过。"""
+        try:
+            settings = await self.bot.db.get_settings(guild.id)
+            cid = settings["showcase_channel_id"] if settings else None
+            if not cid:
+                return
+            record = await self.bot.db.get_file(file_id)
+            if record is None:
+                return
+            ch = guild.get_channel(cid)
+            if not isinstance(ch, discord.TextChannel):
+                try:
+                    fetched = await guild.fetch_channel(cid)
+                    ch = fetched if isinstance(fetched, discord.TextChannel) else None
+                except discord.HTTPException:
+                    ch = None
+            if not isinstance(ch, discord.TextChannel):
+                log.warning("展示频道不可用（guild=%s），跳过卡片发布", guild.id)
+                return
+            msg = await ch.send(
+                embed=build_showcase_embed(record),
+                view=ShowcaseCardView(self, file_id),
+            )
+            await self.bot.db.set_showcase_message(file_id, msg.id)
+        except Exception:
+            log.exception("发布展示卡片失败 guild=%s file=%s", guild.id, file_id)
+
+    async def _delete_showcase_card(self, guild: discord.Guild, record) -> None:
+        """文件删除时同步删除展示卡片，失败不阻塞。"""
+        mid = record["showcase_message_id"]
+        if not mid:
+            return
+        try:
+            settings = await self.bot.db.get_settings(guild.id)
+            cid = settings["showcase_channel_id"] if settings else None
+            ch = guild.get_channel(cid) if cid else None
+            if isinstance(ch, discord.TextChannel):
+                msg = await ch.fetch_message(mid)
+                await msg.delete()
+        except discord.HTTPException:
+            pass
+
     @app_commands.command(name="download", description="从仓库下载文件（下载行为会被记录）")
     @app_commands.describe(file_id="文件编号（如 3）或文件 ID（可用 /files 查询）")
+    @app_commands.autocomplete(file_id=file_ref_autocomplete)
     async def download(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None
         record = await self._resolve_file(interaction.guild.id, file_id)
@@ -1669,6 +1853,7 @@ class FilesCog(commands.Cog, name="文件"):
 
     @app_commands.command(name="fav", description="收藏 / 取消收藏一个文件")
     @app_commands.describe(file_id="文件编号或文件 ID")
+    @app_commands.autocomplete(file_id=file_ref_autocomplete)
     async def fav(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None
         record = await self._resolve_file(interaction.guild.id, file_id)
@@ -1759,6 +1944,7 @@ class FilesCog(commands.Cog, name="文件"):
 
     @app_commands.command(name="fileinfo", description="查看文件详细信息")
     @app_commands.describe(file_id="文件编号或文件 ID")
+    @app_commands.autocomplete(file_id=file_ref_autocomplete)
     async def fileinfo(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None
         record = await self._resolve_file(interaction.guild.id, file_id)
@@ -1795,6 +1981,7 @@ class FilesCog(commands.Cog, name="文件"):
 
     @app_commands.command(name="history", description="查看文件的下载记录（上传者或管理员可用）")
     @app_commands.describe(file_id="文件编号或文件 ID")
+    @app_commands.autocomplete(file_id=file_ref_autocomplete)
     async def history(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None and isinstance(
             interaction.user, discord.Member
@@ -1910,6 +2097,7 @@ class FilesCog(commands.Cog, name="文件"):
 
     @app_commands.command(name="delete", description="删除仓库中的文件（上传者或管理员可用）")
     @app_commands.describe(file_id="文件编号或文件 ID")
+    @app_commands.autocomplete(file_id=file_ref_autocomplete)
     async def delete(self, interaction: discord.Interaction, file_id: str):
         assert interaction.guild is not None and isinstance(
             interaction.user, discord.Member
@@ -1935,6 +2123,9 @@ class FilesCog(commands.Cog, name="文件"):
                 await msg.delete()
             except discord.HTTPException:
                 pass
+
+        # 同步删除展示频道卡片，失败不阻塞
+        await self._delete_showcase_card(interaction.guild, record)
 
         await self.bot.db.delete_file(record["file_id"])
         if is_admin and not is_uploader:

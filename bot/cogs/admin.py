@@ -1440,6 +1440,44 @@ class AdminCog(commands.Cog, name="管理"):
         )
 
     @app_commands.command(
+        name="showcase_channel",
+        description="设置展示频道：新发布的文件自动发卡片（卡片上可直接下载/收藏），留空则关闭",
+    )
+    @app_commands.describe(channel="展示频道；不填则关闭展示卡片")
+    @admin_only
+    async def showcase_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ):
+        assert interaction.guild is not None
+        await self.bot.db.upsert_settings(
+            interaction.guild.id,
+            showcase_channel_id=channel.id if channel else None,
+        )
+        if channel is not None:
+            await interaction.response.send_message(
+                f"✅ 展示频道已设置为 {channel.mention}。\n"
+                "之后新发布（或审核通过）的文件会自动在该频道发卡片，"
+                "成员点卡片上的「📥 下载」即可下载（密码、风控、日志照常生效）。",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "✅ 已关闭展示卡片（已有卡片不会自动删除，按钮会提示文件已下架可手动清理）。",
+                ephemeral=True,
+            )
+        await self.bot.log_admin(
+            interaction.guild,
+            interaction.user,
+            (
+                f"🖼️ 设置展示频道为 {channel.mention}"
+                if channel is not None
+                else "🖼️ 关闭展示频道"
+            ),
+        )
+
+    @app_commands.command(
         name="review_config",
         description="发布审核设置：开启后成员上传需管理员审核通过才发布（管理员）",
     )
@@ -1916,6 +1954,23 @@ class AdminCog(commands.Cog, name="管理"):
                         await cat.delete()
                     except (discord.Forbidden, discord.HTTPException):
                         pass
+
+        # 尽量清除展示频道里的文件卡片，失败不阻塞
+        cards_removed = 0
+        try:
+            cards = await self.bot.db.list_showcase_cards_in_guild(guild.id)
+            if cards and settings and settings["showcase_channel_id"]:
+                sch = guild.get_channel(settings["showcase_channel_id"])
+                if isinstance(sch, discord.TextChannel):
+                    for row in cards:
+                        try:
+                            card_msg = await sch.fetch_message(row["showcase_message_id"])
+                            await card_msg.delete()
+                            cards_removed += 1
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            pass
+        except Exception:
+            log.exception("清除展示卡片失败（不阻塞初始化）")
 
         stats = await self.bot.db.purge_guild(guild.id)
         stats["channel_deleted"] = channel_deleted

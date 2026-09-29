@@ -187,6 +187,8 @@ class Database:
             "ALTER TABLE settings ADD COLUMN vote_organize_guild INTEGER NOT NULL DEFAULT 3",
             "ALTER TABLE settings ADD COLUMN vote_reset INTEGER NOT NULL DEFAULT 3",
             "ALTER TABLE settings ADD COLUMN vote_appeal INTEGER NOT NULL DEFAULT 2",
+            "ALTER TABLE settings ADD COLUMN showcase_channel_id INTEGER",
+            "ALTER TABLE files ADD COLUMN showcase_message_id INTEGER",
         ):
             try:
                 await self._conn.execute(migration)
@@ -797,6 +799,57 @@ class Database:
             """,
             (guild_id, user_id, limit),
         )
+        return await cur.fetchall()
+
+    async def set_showcase_message(self, file_id: str, message_id) -> None:
+        await self.conn.execute(
+            "UPDATE files SET showcase_message_id = ? WHERE file_id = ?",
+            (message_id, file_id),
+        )
+        await self.conn.commit()
+
+    async def list_showcase_cards(self) -> list[aiosqlite.Row]:
+        """所有已发布且带展示卡片的文件（Bot 重启后恢复卡片按钮用）。"""
+        cur = await self.conn.execute(
+            "SELECT file_id, showcase_message_id FROM files "
+            "WHERE showcase_message_id IS NOT NULL AND status = 'approved'"
+        )
+        return await cur.fetchall()
+
+    async def list_showcase_cards_in_guild(self, guild_id: int) -> list[aiosqlite.Row]:
+        """某服务器的全部展示卡片（初始化时清理用）。"""
+        cur = await self.conn.execute(
+            "SELECT file_id, showcase_message_id FROM files "
+            "WHERE origin_guild_id = ? AND showcase_message_id IS NOT NULL",
+            (guild_id,),
+        )
+        return await cur.fetchall()
+
+    async def search_file_refs(
+        self, guild_id: int, keyword: str, *, limit: int = 25
+    ) -> list[aiosqlite.Row]:
+        """自动补全用：按编号或名称/描述模糊匹配。"""
+        kw = keyword.strip()
+        if kw.isdigit():
+            cur = await self.conn.execute(
+                """
+                SELECT * FROM files
+                WHERE origin_guild_id = ? AND status = 'approved'
+                  AND (seq = ? OR name LIKE ?)
+                ORDER BY uploaded_at DESC LIMIT ?
+                """,
+                (guild_id, int(kw), f"%{kw}%", limit),
+            )
+        else:
+            cur = await self.conn.execute(
+                """
+                SELECT * FROM files
+                WHERE origin_guild_id = ? AND status = 'approved'
+                  AND (name LIKE ? OR description LIKE ?)
+                ORDER BY uploaded_at DESC LIMIT ?
+                """,
+                (guild_id, f"%{kw}%", f"%{kw}%", limit),
+            )
         return await cur.fetchall()
 
     async def get_user_download_files(
