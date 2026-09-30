@@ -684,6 +684,46 @@ class CollectionView(discord.ui.View):
         await self.cog.start_download(interaction, record)
 
 
+class CollectionsBrowseView(discord.ui.View):
+    """/collections：从「开启了合集的作者」中选择一位，实时展开其合集。"""
+
+    def __init__(self, cog: "FilesCog", entries: list[tuple[int, str, int]]):
+        super().__init__(timeout=600)
+        self.cog = cog
+        options = [
+            discord.SelectOption(
+                label=name[:100],
+                description=f"{count} 个文件",
+                value=str(author_id),
+                emoji="📚",
+            )
+            for author_id, name, count in entries[:25]
+        ]
+        placeholder = "选择一位作者查看其合集…"
+        if len(entries) > 25:
+            placeholder += "（仅显示文件最多的前 25 位）"
+        select = discord.ui.Select(placeholder=placeholder, options=options)
+        select.callback = self._pick_author
+        self.add_item(select)
+
+    async def _pick_author(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        author_id = int(interaction.data["values"][0])
+        guild = interaction.guild
+        protected, plain = await self.cog._build_collection(guild.id, author_id)
+        name = await self.cog._author_display_name(guild, author_id)
+        if not protected and not plain:
+            await interaction.response.send_message(
+                f"📭 {name} 的合集暂时没有文件。", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            embed=build_collection_embed(name, protected, plain),
+            view=CollectionView(self.cog, author_id, protected, plain),
+            ephemeral=True,
+        )
+
+
 class BatchUploadModal(discord.ui.Modal, title="批量上传设置（应用于全部文件）"):
     """批量上传的共享设置：下载密码 / 声明（均可选）。"""
 
@@ -1168,8 +1208,9 @@ class PublishReviewView(discord.ui.View):
         await self.bot.log_admin(
             interaction.guild,
             interaction.user,
-            f"✅ 审核通过发布：`{record['name']}`（编号 `#{record['seq']}`，"
-            f"上传者 <@{record['uploader_id']}>）",
+            f"✅ 审核通过发布：`{record['name']}`（"
+            + (f"编号 `#{record['seq']}`" if record["seq"] else "合集文件")
+            + f"，上传者 <@{record['uploader_id']}>）",
         )
 
     @discord.ui.button(
@@ -1678,9 +1719,17 @@ class FilesCog(commands.Cog, name="文件"):
                 except discord.HTTPException:
                     pass
             await self.bot.db.delete_collection(guild.id, author.id)
-            await interaction.response.send_message(
-                "✅ 合集已关闭，面板消息已删除。", ephemeral=True
+            # 关闭合集：文件重新分配编号，回到 /files 编号列表
+            restored = await self.bot.db.set_collection_numbering(
+                guild.id, author.id, numbered=True
             )
+            text = "✅ 合集已关闭，面板消息已删除。"
+            if restored:
+                text += (
+                    f"\n🔢 你的 {restored} 个文件已重新分配编号，"
+                    "回到 /files 编号列表。"
+                )
+            await interaction.response.send_message(text, ephemeral=True)
             return
 
         if not isinstance(interaction.channel, discord.TextChannel):
@@ -1708,11 +1757,56 @@ class FilesCog(commands.Cog, name="文件"):
         await self.bot.db.upsert_collection(
             guild.id, author.id, interaction.channel.id, msg.id
         )
-        await interaction.followup.send(
+        # 开启合集：作者全部文件退出仓库编号池，仅经合集面板 / /collections 分发
+        moved = await self.bot.db.set_collection_numbering(
+            guild.id, author.id, numbered=False
+        )
+        text = (
             f"✅ 合集面板已发布：{msg.jump_url}\n"
             "之后你上传/删除文件时面板会自动刷新；"
-            "想换频道的话，在目标频道再执行一次 `/collection 开启` 即可。",
-            ephemeral=True,
+            "想换频道的话，在目标频道再执行一次 `/collection 开启` 即可。"
+        )
+        if moved:
+            text += (
+                f"\n📚 你的 {moved} 个文件已退出仓库编号列表，"
+                "成员可通过本面板或 `/collections` 选择你进行下载。"
+            )
+        text += "\n此后你新上传的文件也不再占用仓库编号。"
+        await interaction.followup.send(text, ephemeral=True)
+
+    @app_commands.command(
+        name="collections",
+        description="浏览开启了合集的作者，选择作者即可直接下载其合集文件",
+    )
+    async def collections(self, interaction: discord.Interaction):
+        assert interaction.guild is not None
+        guild = interaction.guild
+        rows = await self.bot.db.list_collections_in_guild(guild.id)
+        entries: list[tuple[int, str, int]] = []
+        for row in rows:
+            protected, plain = await self._build_collection(guild.id, row["author_id"])
+            name = await self._author_display_name(guild, row["author_id"])
+            entries.append((row["author_id"], name, len(protected) + len(plain)))
+        if not entries:
+            await interaction.response.send_message(
+                "📭 本服务器还没有人开启合集。\n"
+                "作者可执行 `/collection 开启` 发布自己的合集面板。",
+                ephemeral=True,
+            )
+            return
+        entries.sort(key=lambda e: (-e[2], e[1]))
+        total_files = sum(e[2] for e in entries)
+        lines = [f"📚 **{name}**：{count} 个文件" for _, name, count in entries[:10]]
+        if len(entries) > 10:
+            lines.append(f"…等共 {len(entries)} 位作者")
+        embed = discord.Embed(
+            title=f"📚 本服务器的合集（{len(entries)} 位作者 · {total_files} 个文件）",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="从下方菜单选择作者，即可浏览并下载其合集文件")
+        await interaction.response.send_message(
+            embed=embed, view=CollectionsBrowseView(self, entries), ephemeral=True
         )
 
     async def _do_upload(self, interaction: discord.Interaction, prep: UploadPrepView) -> None:
@@ -1823,10 +1917,15 @@ class FilesCog(commands.Cog, name="文件"):
             password=prep.password,
             status="pending" if needs_review else "approved",
             author_note=prep.author_note or None,
+            # 上传者已开启合集：不占仓库编号，经合集面板 / /collections 分发
+            numbered=await self.bot.db.get_collection(guild.id, uploader.id) is None,
         )
 
         # 回写文件 ID 到存储消息的 embed，方便管理员对照
-        embed.set_footer(text=f"编号 #{seq} · 文件 ID：{file_id}")
+        embed.set_footer(
+            text=(f"编号 #{seq}" if seq else "合集文件（不占编号）")
+            + f" · 文件 ID：{file_id}"
+        )
         try:
             await storage_msg.edit(embed=embed)
         except discord.HTTPException:
@@ -1862,21 +1961,26 @@ class FilesCog(commands.Cog, name="文件"):
         await self._refresh_collection_panel(guild, uploader.id)
 
         # 管理日志：上传时重命名同步记录
+        seq_ref = f"编号 `#{seq}`" if seq else "合集文件"
         if prep.name != prep.original_name:
             await self.bot.log_admin(
                 guild,
                 uploader,
-                f"✏️ 上传时重命名文件：`{prep.original_name}` → `{prep.name}`（编号 `#{seq}`）",
+                f"✏️ 上传时重命名文件：`{prep.original_name}` → `{prep.name}`（{seq_ref}）",
             )
 
+        if seq:
+            download_tip = f"使用 `/download {seq}` 或 `/download {file_id}`"
+        else:
+            download_tip = "已自动收录进你的合集面板；成员可执行 /collections 选择你后下载"
         desc = (
             f"📄 文件名：`{prep.name}`\n"
-            f"🔢 编号：`#{seq}`\n"
-            f"🆔 文件 ID：`{file_id}`\n"
+            + (f"🔢 编号：`#{seq}`\n" if seq else "📚 收录：你的合集（不占用仓库编号）\n")
+            + f"🆔 文件 ID：`{file_id}`\n"
             f"💾 大小：{fmt_size(len(prep.data))}\n"
             f"🔒 下载密码：{'已设置' if prep.password else '无'}\n"
             f"📝 声明：{'已填写' if prep.author_note else '无'}\n"
-            f"📥 下载方式：使用 `/download {seq}` 或 `/download {file_id}`"
+            f"📥 下载方式：{download_tip}"
         )
         if prep.name != prep.original_name:
             desc += f"\n✏️ 原名：`{prep.original_name}`"
@@ -1892,7 +1996,7 @@ class FilesCog(commands.Cog, name="文件"):
         interaction: discord.Interaction,
         prep: UploadPrepView,
         file_id: str,
-        seq: int,
+        seq: int | None,
         storage_msg: discord.Message,
         review_ch: discord.TextChannel,
     ) -> None:
@@ -1904,8 +2008,9 @@ class FilesCog(commands.Cog, name="文件"):
             color=discord.Color.orange(),
             timestamp=datetime.now(timezone.utc),
         )
+        seq_ref = f"编号 `#{seq}`" if seq else "合集文件"
         embed.add_field(
-            name="文件", value=f"`{file_id}` · {prep.name}（编号 `#{seq}`）", inline=False
+            name="文件", value=f"`{file_id}` · {prep.name}（{seq_ref}）", inline=False
         )
         embed.add_field(
             name="上传者", value=f"{uploader.mention} (`{uploader.id}`)", inline=True
@@ -1932,12 +2037,12 @@ class FilesCog(commands.Cog, name="文件"):
             )
         await self.bot.db.set_review_message(file_id, msg.id)
         await self.bot.log_admin(
-            guild, uploader, f"🔍 上传进入待审核：`{prep.name}`（编号 `#{seq}`）"
+            guild, uploader, f"🔍 上传进入待审核：`{prep.name}`（{seq_ref}）"
         )
         desc = (
             f"📄 文件名：`{prep.name}`\n"
-            f"🔢 编号：`#{seq}`\n"
-            f"🆔 文件 ID：`{file_id}`\n"
+            + (f"🔢 编号：`#{seq}`\n" if seq else "📚 收录：你的合集（不占用仓库编号）\n")
+            + f"🆔 文件 ID：`{file_id}`\n"
             "🔍 状态：**待审核**——管理员通过后自动发布，结果将私信通知你。"
         )
         await interaction.edit_original_response(
@@ -1972,6 +2077,16 @@ class FilesCog(commands.Cog, name="文件"):
         plain = [r for r in files if not r["password"]]
         return protected, plain
 
+    async def _author_display_name(self, guild: discord.Guild, author_id: int) -> str:
+        """作者的当前显示名（缓存未命中时回退 API，再退化为“用户 ID”）。"""
+        member = guild.get_member(author_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(author_id)
+            except discord.HTTPException:
+                member = None
+        return member.display_name if member else f"用户 {author_id}"
+
     async def _refresh_collection_panel(
         self, guild: discord.Guild, author_id: int
     ) -> None:
@@ -1996,8 +2111,7 @@ class FilesCog(commands.Cog, name="文件"):
             except discord.NotFound:
                 await self.bot.db.delete_collection(guild.id, author_id)
                 return
-            member = guild.get_member(author_id)
-            name = member.display_name if member else f"用户 {author_id}"
+            name = await self._author_display_name(guild, author_id)
             protected, plain = await self._build_collection(guild.id, author_id)
             await message.edit(
                 embed=build_collection_embed(name, protected, plain),
@@ -2057,7 +2171,9 @@ class FilesCog(commands.Cog, name="文件"):
         record = await self._resolve_file(interaction.guild.id, file_id)
         if record is None:
             await interaction.response.send_message(
-                "❌ 找不到该文件，请检查编号或文件 ID。", ephemeral=True
+                "❌ 找不到该文件，请检查编号或文件 ID。\n"
+                "💡 合集文件不占用编号，可执行 /collections 选择作者后下载。",
+                ephemeral=True,
             )
             return
         await self.start_download(interaction, record)

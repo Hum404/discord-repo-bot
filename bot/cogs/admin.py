@@ -1822,6 +1822,10 @@ class AdminCog(commands.Cog, name="管理"):
                                     storage_channel_id=ch.id,
                                     storage_message_id=msg.id,
                                     uploaded_at=int(msg.created_at.timestamp()),
+                                    numbered=await self.bot.db.get_collection(
+                                        guild.id, msg.author.id
+                                    )
+                                    is None,
                                 )
                                 stats["registered"] += 1
                             else:
@@ -1845,9 +1849,18 @@ class AdminCog(commands.Cog, name="管理"):
                                     storage_channel_id=storage.id,
                                     storage_message_id=new_msg.id,
                                     uploaded_at=int(msg.created_at.timestamp()),
+                                    numbered=await self.bot.db.get_collection(
+                                        guild.id, msg.author.id
+                                    )
+                                    is None,
                                 )
                                 embed.set_footer(
-                                    text=f"编号 #{seq} · 文件 ID：{file_id}"
+                                    text=(
+                                        f"编号 #{seq}"
+                                        if seq
+                                        else "合集文件（不占编号）"
+                                    )
+                                    + f" · 文件 ID：{file_id}"
                                 )
                                 try:
                                     await new_msg.edit(embed=embed)

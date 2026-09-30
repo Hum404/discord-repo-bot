@@ -561,14 +561,18 @@ class Database:
         uploaded_at: int | None = None,
         status: str = "approved",
         author_note: str | None = None,
-    ) -> tuple[str, int]:
+        numbered: bool = True,
+    ) -> tuple[str, int | None]:
         file_id = new_file_id()
         async with self._write_lock:
-            cur = await self.conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM files WHERE origin_guild_id = ?",
-                (origin_guild_id,),
-            )
-            (seq,) = await cur.fetchone()
+            if numbered:
+                cur = await self.conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM files WHERE origin_guild_id = ?",
+                    (origin_guild_id,),
+                )
+                (seq,) = await cur.fetchone()
+            else:
+                seq = None  # 合集文件：不占用仓库编号，通过合集面板 / /collections 访问
             await self.conn.execute(
                 """
                 INSERT INTO files (
@@ -615,9 +619,11 @@ class Database:
     async def list_files(
         self, guild_id: int, *, limit: int = 10, offset: int = 0
     ) -> list[aiosqlite.Row]:
+        # 合集文件（seq IS NULL）不占编号、不出现在列表中
         cur = await self.conn.execute(
             """
-            SELECT * FROM files WHERE origin_guild_id = ? AND status = 'approved'
+            SELECT * FROM files
+            WHERE origin_guild_id = ? AND status = 'approved' AND seq IS NOT NULL
             ORDER BY uploaded_at DESC LIMIT ? OFFSET ?
             """,
             (guild_id, limit, offset),
@@ -626,7 +632,8 @@ class Database:
 
     async def count_files(self, guild_id: int) -> int:
         cur = await self.conn.execute(
-            "SELECT COUNT(*) FROM files WHERE origin_guild_id = ? AND status = 'approved'",
+            "SELECT COUNT(*) FROM files WHERE origin_guild_id = ? AND status = 'approved' "
+            "AND seq IS NOT NULL",
             (guild_id,),
         )
         row = await cur.fetchone()
@@ -638,7 +645,7 @@ class Database:
         cur = await self.conn.execute(
             """
             SELECT * FROM files
-            WHERE origin_guild_id = ? AND status = 'approved'
+            WHERE origin_guild_id = ? AND status = 'approved' AND seq IS NOT NULL
               AND (name LIKE ? OR description LIKE ?)
             ORDER BY uploaded_at DESC LIMIT ?
             """,
@@ -847,6 +854,46 @@ class Database:
         )
         return await cur.fetchall()
 
+    async def set_collection_numbering(
+        self, guild_id: int, author_id: int, numbered: bool
+    ) -> int:
+        """合集开关时迁移作者文件的编号状态。返回受影响的文件数。
+
+        numbered=False（开启合集）：作者全部文件退出编号池（seq 置 NULL），
+        从 /files、/search、编号自动补全中消失，仅经合集面板与 /collections 访问；
+        numbered=True（关闭合集）：按上传时间顺序从当前最大编号接续重排，回到编号列表。
+        """
+        if not numbered:
+            cur = await self.conn.execute(
+                "UPDATE files SET seq = NULL "
+                "WHERE origin_guild_id = ? AND uploader_id = ? AND seq IS NOT NULL",
+                (guild_id, author_id),
+            )
+            await self.conn.commit()
+            return cur.rowcount
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                "SELECT file_id FROM files "
+                "WHERE origin_guild_id = ? AND uploader_id = ? AND seq IS NULL "
+                "ORDER BY uploaded_at, file_id",
+                (guild_id, author_id),
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                return 0
+            cur = await self.conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM files WHERE origin_guild_id = ?",
+                (guild_id,),
+            )
+            (seq,) = await cur.fetchone()
+            for row in rows:
+                seq += 1
+                await self.conn.execute(
+                    "UPDATE files SET seq = ? WHERE file_id = ?", (seq, row["file_id"])
+                )
+            await self.conn.commit()
+            return len(rows)
+
     async def delete_collection(self, guild_id: int, author_id: int) -> None:
         async with self._write_lock:
             await self.conn.execute(
@@ -896,13 +943,13 @@ class Database:
     async def search_file_refs(
         self, guild_id: int, keyword: str, *, limit: int = 25
     ) -> list[aiosqlite.Row]:
-        """自动补全用：按编号或名称/描述模糊匹配。"""
+        """自动补全用：按编号或名称/描述模糊匹配（合集文件不参与编号补全）。"""
         kw = keyword.strip()
         if kw.isdigit():
             cur = await self.conn.execute(
                 """
                 SELECT * FROM files
-                WHERE origin_guild_id = ? AND status = 'approved'
+                WHERE origin_guild_id = ? AND status = 'approved' AND seq IS NOT NULL
                   AND (seq = ? OR name LIKE ?)
                 ORDER BY uploaded_at DESC LIMIT ?
                 """,
@@ -912,7 +959,7 @@ class Database:
             cur = await self.conn.execute(
                 """
                 SELECT * FROM files
-                WHERE origin_guild_id = ? AND status = 'approved'
+                WHERE origin_guild_id = ? AND status = 'approved' AND seq IS NOT NULL
                   AND (name LIKE ? OR description LIKE ?)
                 ORDER BY uploaded_at DESC LIMIT ?
                 """,
